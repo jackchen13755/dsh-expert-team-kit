@@ -23,7 +23,22 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { apply, inject, name as pluginName } from '../lib/index.js'
+// lib/index.js 依赖宿主的 defineTool（@deepseek-ai/dsh-tools 由 DSH 运行时解析，
+// profile 不安装核心包）。纯 node 环境下解析不到，此时跳过插件入口的用例，
+// 而不是让整个套件变红 —— 入口的正确性在宿主内用「工具表出现 expert_brief」验证。
+let apply = null
+let inject = null
+let pluginName = null
+try {
+  const indexModule = await import('../lib/index.js')
+  ;({ apply, inject, name: pluginName } = indexModule)
+} catch {
+  apply = null
+  inject = null
+  pluginName = null
+}
+const NO_HOST = pluginName === null ? '需宿主 @deepseek-ai/dsh-tools，纯 node 环境跳过' : false
+
 import { buildBrief } from '../lib/brief.mjs'
 import { PersonaError, resolvePersona } from '../lib/persona.mjs'
 import {
@@ -576,8 +591,8 @@ test('execute: 同参数多次调用产出逐字节相同（纯函数，无隐�
   assert.equal(typeof first, 'string')
 })
 
-test('依赖方向: lib/tool.mjs、lib/index.js、bin/expert-brief.mjs 都不 import 宿主包', () => {
-  const files = ['../lib/tool.mjs', '../lib/index.js', '../bin/expert-brief.mjs']
+test('依赖方向: lib/tool.mjs、bin/expert-brief.mjs 不 import 宿主包（index.js 例外）', () => {
+  const files = ['../lib/tool.mjs', '../bin/expert-brief.mjs']
 
   for (const relative of files) {
     const source = fs.readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8')
@@ -596,9 +611,14 @@ test('依赖方向: lib/tool.mjs、lib/index.js、bin/expert-brief.mjs 都不 im
     )
   }
 
-  // 插件入口必须留一行注释解释「为什么用普通对象」
+  // 插件入口必须用宿主 defineTool：裸对象塞进 ctx.tools.register 不会出现在工具表里
   const indexSource = fs.readFileSync(fileURLToPath(new URL('../lib/index.js', import.meta.url)), 'utf8')
-  assert.match(indexSource, /普通对象/, 'index.js 必须注释说明用普通对象而非 defineTool 的原因')
+  assert.match(
+    indexSource,
+    /import \{ defineTool \} from '@deepseek-ai\/dsh-tools'/,
+    'index.js 必须用宿主 defineTool 构造工具定义（裸对象不会被宿主投影成可用工具）',
+  )
+  assert.match(indexSource, /output:\s*\{/, 'index.js 的定义必须带 output（schema + render）')
 })
 
 test('人格素材环境问题原样透传（不被误报成入参错误）', () => {
@@ -618,7 +638,7 @@ test('人格素材环境问题原样透传（不被误报成入参错误）', ()
 
 // ——————————————————————————— 5. 插件入口 ———————————————————————————
 
-test('lib/index.js: name / inject / apply 形状正确，apply 注册的工具名是 expert_brief', () => {
+test('lib/index.js: name / inject / apply 形状正确，apply 注册的工具名是 expert_brief', { skip: NO_HOST }, async () => {
   assert.equal(pluginName, 'expert-team-kit')
   assert.deepEqual(inject, ['tools'])
   assert.equal(typeof apply, 'function')
@@ -632,16 +652,30 @@ test('lib/index.js: name / inject / apply 形状正确，apply 注册的工具�
   assert.equal(registered.length, 1, 'apply 必须注册恰好一个工具')
   assert.equal(registered[0].name, 'expert_brief')
   assert.equal(typeof registered[0].execute, 'function')
+  // 宿主要求定义带 output（schema + render），否则不会被投影成可用工具
+  assert.equal(typeof registered[0].output?.render, 'function', '定义必须带 output.render')
 
-  // 注册进去的必须是普通对象：没有宿主 SDK 的类型标记/原型方法
-  assert.equal(Object.getPrototypeOf(registered[0]), Object.prototype, '工具规格应是普通对象')
+  // 注册的定义真的可执行（不是空壳）。defineTool 会把 execute 包成异步，
+  // 返回值再经 output.render 收敛为渲染后的文本。
+  const raw = registered[0].execute(makeArgs())
+  const value = raw instanceof Promise ? await raw : raw
+  const text = typeof value === 'string'
+    ? value
+    : Array.isArray(value) ? (value[0]?.text ?? '') : (value?.content?.[0]?.text ?? '')
+  assert.equal(typeof text, 'string')
+  assert.ok(text.includes(PERSONA_MARKER), 'execute 必须真的产出任务书正文')
 
-  // 注册的 spec 真的可执行（不是空壳）
-  const text = registered[0].execute(makeArgs()).content[0].text
-  assert.ok(text.includes(PERSONA_MARKER))
+  // ctx.effect 存在时应经由它注册（跟随插件生命周期释放）
+  const viaEffect = []
+  const ctxWithEffect = {
+    tools: { register: (spec) => viaEffect.push(spec) },
+    effect: (fn) => fn(),
+  }
+  apply(ctxWithEffect)
+  assert.equal(viaEffect.length, 1, 'ctx.effect 可用时应在 effect 内注册')
 })
 
-test('lib/index.js: ctx 缺 tools.register 时直接抛可操作错误，而不是静默跳过', () => {
+test('lib/index.js: ctx 缺 tools.register 时直接抛可操作错误，而不是静默跳过', { skip: NO_HOST }, () => {
   for (const badCtx of [undefined, null, {}, { tools: {} }, { tools: { register: 'nope' } }]) {
     assert.throws(() => apply(badCtx), /ctx\.tools\.register/, `ctx=${JSON.stringify(badCtx)} 必须抛错`)
   }
