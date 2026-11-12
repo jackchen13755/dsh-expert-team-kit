@@ -681,6 +681,23 @@ test('lib/index.js: ctx 缺 tools.register 时直接抛可操作错误，而不�
   }
 })
 
+test('回归: index.js 不得解构 tools.register（会丢 this，注册表抛 layers 未定义）', () => {
+  const source = fs.readFileSync(fileURLToPath(new URL('../lib/index.js', import.meta.url)), 'utf8')
+
+  // 真实注册表内部读 this.layers：把 register 解构出来再调用会抛
+  // "Cannot read properties of undefined (reading 'layers')"，而该异常被 cordis
+  // 吞进 fiber —— 症状是「插件装上了但工具表里没有」，没有可见报错。
+  assert.ok(
+    !/const\s+register\s*=\s*ctx\??\.tools\??\.register/.test(source),
+    'index.js 不得把 tools.register 解构到局部变量后再调用（丢 this）',
+  )
+  assert.match(
+    source,
+    /tools\.register\(definition\)/,
+    '必须通过 tools.register(...) 调用以保住 this 绑定',
+  )
+})
+
 // ——————————————————————————— 6. CLI ———————————————————————————
 
 /**
