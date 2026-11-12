@@ -1,0 +1,17 @@
+# dsh-expert-team-kit bundle patch
+#
+# Mounts the plugin into a dsh profile's host composition. The plugin registers
+# the `expert_brief` tool into the shared `tools` registry, so any session of the
+# profile can turn an expert slug plus a task into a self-contained teammate
+# brief. There is no client half and no UI.
+#
+# Install:
+#   dsh plugin --profile <name> add github:jackchen13755/dsh-expert-team-kit
+#
+# The plugin has zero runtime dependencies and imports no host packages: the tool
+# is registered as a plain object rather than through defineTool, so the package
+# stays unit-testable without a host.
+- insert:
+    - id: expert-team-kit
+      # Node-resolvable package name — must stay in sync with package.json `name`.
+      name: dsh-expert-team-kit

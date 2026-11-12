@@ -1,0 +1,45 @@
+{
+  "name": "dsh-expert-team-kit",
+  "version": "0.1.0",
+  "description": "Agent Teams 任务书工具箱：解析专家人格素材、生成带人格正文/验收命令/写作用域的任务书。提供 expert_brief 工具与 expert-brief CLI。",
+  "type": "module",
+  "main": "./lib/index.js",
+  "bin": {
+    "expert-brief": "./bin/expert-brief.mjs"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./persona": "./lib/persona.mjs",
+    "./brief": "./lib/brief.mjs",
+    "./lib/*": "./lib/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "agent-teams",
+    "persona",
+    "prompt",
+    "cli"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
