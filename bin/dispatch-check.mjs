@@ -63,6 +63,82 @@ const BRIEF_TOOLS = new Set(['expert_brief'])
 /** 子会话登记事件：出现在父日志里，出现即说明起过子会话。 */
 const CATALOG_EVENT = 'subagent/catalog'
 
+/**
+ * 「队友 prompt 里有没有专家人格」的**文本标记**。
+ *
+ * 判定的是「prompt 命中了专家人格的招牌字句」，不是「prompt 写得像不像任务书」——
+ * 一个字节 persona 都没有的 prompt 也可能很长、很细致（真实事故里 6988 字节的 prompt
+ * 一个标记都不命中），所以只能按 persona md 的固定骨架来认。
+ *
+ * 这几条都是 `expert_brief` 拼出来的任务书与 `assets/agency-agents/**` 人格正文里的
+ * **稳定骨架**（标题 `## Core Mission`、`## Critical Rules`、`# <Name> Agent`、
+ * `**Agent Personality**`、正文里的「人格」二字等）。放宽到「提到专家名」就会把
+ * 「你是 frontend-developer」判成「有人格」，而名字恰恰是事故里唯一对的东西。
+ */
+export const PERSONA_MARKERS = [
+  'You are **',
+  'Agent Personality',
+  'Core Mission',
+  'Critical Rules',
+  'Identity',
+  '人格',
+]
+
+/** 人格正文的 Markdown 标题形态，如 `# Code Reviewer Agent` / `# Frontend Developer Agent`。 */
+export const PERSONA_HEADING_RE = /#\s+\w[\w ]*Agent\b/
+
+/** `samples` 最多留几个队友名（只是给人看的线索，不承担准确性）。 */
+export const PERSONA_SAMPLE_LIMIT = 5
+
+/**
+ * 这段 prompt 文本里有没有专家人格的痕迹。
+ *
+ * 空串 / 非字符串一律 `false`：空 prompt 显然没人格（它连任务都没有）。
+ *
+ * @param {unknown} prompt
+ * @returns {boolean}
+ */
+export function hasPersona(prompt) {
+  if (typeof prompt !== 'string' || prompt === '') return false
+  if (PERSONA_MARKERS.some((marker) => prompt.includes(marker))) return true
+  return PERSONA_HEADING_RE.test(prompt)
+}
+
+/**
+ * 从一条 `subagent` / `subagent_fork` 的 `tool/call` 里取 `prompt` 与 `name`。
+ *
+ * `arguments` 在真实日志里是**字符串**（JSON 文本），要二次 parse；任何异常形态都返回
+ * `{ ok: false, reason }`，绝不抛 —— 由调用方转成 warning 并**不计入 checked**
+ * （解析不出 prompt 时不能假装「检查过他，没人格」，那是编造证据）。
+ *
+ * `prompt` 缺失 / 不是字符串同样 `ok: false`；但**空串 `''` 是合法 prompt**，
+ * 会以 `ok: true, prompt: ''` 返回、由 `hasPersona` 判为「没人格」。
+ *
+ * @returns {{ok: true, prompt: string, name: string|null} | {ok: false, reason: string}}
+ */
+export function readSubagentPrompt(event) {
+  const raw = event && event.data ? event.data.arguments : undefined
+
+  if (typeof raw !== 'string') {
+    return { ok: false, reason: `arguments 不是字符串（${raw === undefined ? 'undefined' : typeof raw}）` }
+  }
+  if (raw.trim() === '') return { ok: false, reason: 'arguments 是空字符串' }
+
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    return { ok: false, reason: `arguments 不是合法 JSON（${error.message}）` }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, reason: 'arguments 不是 JSON 对象' }
+  }
+  if (typeof parsed.prompt !== 'string') {
+    return { ok: false, reason: `缺少 prompt（${parsed.prompt === undefined ? 'undefined' : typeof parsed.prompt}）` }
+  }
+  return { ok: true, prompt: parsed.prompt, name: typeof parsed.name === 'string' && parsed.name !== '' ? parsed.name : null }
+}
+
 /** 会话日志候选文件名，按优先级排列（压缩优先，与真实布局一致）。 */
 const LOG_BASENAMES = ['session.v4.jsonl.zstd', 'session.jsonl', 'session.v4.jsonl']
 
@@ -391,10 +467,23 @@ export function countCalls(events, scope = '主会话') {
  * 只数事件、不解析 `arguments`：这里要回答的是「有没有派活」，不是「派给了谁」，
  * 所以坏 arguments 也不影响本计数（也不该为它记 warning，否则诊断噪声掩盖真问题）。
  *
- * @returns {{subagents: number, expertCalls: number, briefs: number, catalog: number}}
+ * **例外：`persona`。** 这一项必须读 `arguments.prompt`，所以坏 arguments 会影响它；
+ * 但坏 arguments **不计入 `checked`**（解析不出 prompt ≠ 检查过且没人格），只记 warning。
+ * 这条区分很重要：把解析失败算成 missing 会把日志残缺说成「队友没带人格」，
+ * 而把解析失败静默跳过又会让人以为「这一轮没人格问题」。
+ *
+ * @param {any[]} events
+ * @param {string[]} [warnings] 解析异常时追加 warning 的数组（不传则只丢给 console 之外的调用方忽略）
+ * @returns {{subagents: number, expertCalls: number, briefs: number, catalog: number, persona: {checked: number, missing: number, samples: string[]}}}
  */
-export function countDispatch(events) {
-  const dispatch = { subagents: 0, expertCalls: 0, briefs: 0, catalog: 0 }
+export function countDispatch(events, warnings = []) {
+  const dispatch = {
+    subagents: 0,
+    expertCalls: 0,
+    briefs: 0,
+    catalog: 0,
+    persona: { checked: 0, missing: 0, samples: [] },
+  }
 
   for (const event of Array.isArray(events) ? events : []) {
     if (!event) continue
@@ -407,12 +496,69 @@ export function countDispatch(events) {
     const name = event.data ? event.data.name : undefined
     if (typeof name !== 'string') continue
 
-    if (SUBAGENT_TOOLS.has(name)) dispatch.subagents += 1
-    else if (EXPERT_TOOLS.has(name)) dispatch.expertCalls += 1
+    if (SUBAGENT_TOOLS.has(name)) {
+      dispatch.subagents += 1
+      // 每个 subagent 调用都要看 prompt：这是「命名≠人格注入」唯一的事后证据。
+      const read = readSubagentPrompt(event)
+      if (!read.ok) {
+        warnings.push(`有一次 ${name} 调用无法解析（${read.reason}），人格检查跳过，不计入 checked`)
+        continue
+      }
+      dispatch.persona.checked += 1
+      if (!hasPersona(read.prompt)) {
+        dispatch.persona.missing += 1
+        if (dispatch.persona.samples.length < PERSONA_SAMPLE_LIMIT) {
+          dispatch.persona.samples.push(read.name || `(未命名队友 #${dispatch.persona.checked})`)
+        }
+      }
+    } else if (EXPERT_TOOLS.has(name)) dispatch.expertCalls += 1
     else if (BRIEF_TOOLS.has(name)) dispatch.briefs += 1
   }
 
   return dispatch
+}
+
+/**
+ * 「队友 prompt 里没有专家人格」的 warning 文案；`missing === 0` 时返回 `null`。
+ *
+ * 文案里的两个数字是同一个量（缺几个），不是笔误：`samples` 最多只留
+ * `PERSONA_SAMPLE_LIMIT` 个名字，缺 7 个时名字只能列 5 个，所以**必须同时给出真实缺数**，
+ * 否则读者会以为「只缺了列出来的这几个」。
+ *
+ * 这条文案刻意点出「命名≠人格注入」：真实事故里三个队友名字全对（`frontend-developer` /
+ * `frontend-developer-2` / `testing-reality-checker`），prompt 却一个 persona 字节都没有，
+ * 人以为人格也跟着名字进去了。不把这句话写在 warning 里，读者只会以为「名字都起了还有什么问题」。
+ *
+ * @returns {string|null}
+ */
+export function buildPersonaWarning(dispatch = {}) {
+  const persona = dispatch && dispatch.persona ? dispatch.persona : {}
+  const missing = Number(persona.missing) || 0
+  if (missing <= 0) return null
+
+  const samples = Array.isArray(persona.samples) ? persona.samples.filter((name) => typeof name === 'string') : []
+  const names = samples.length > 0 ? `：${samples.join(', ')}` : ''
+  return (
+    `本轮 ${missing} 个队友的 prompt 里没有专家人格（缺 ${missing} 个${names}）` +
+    '—— 命名≠人格注入，请用 expert_brief 生成任务书或把 persona md 正文贴进 prompt'
+  )
+}
+
+/**
+ * 人类输出里的「人格注入」一行；`checked === 0`（本轮没起队友）时返回 `null`（不打印）。
+ *
+ * @returns {string|null} 如 `人格注入   2/3 有 persona（缺：worker-a）`
+ */
+export function describePersona(dispatch = {}) {
+  const persona = dispatch && dispatch.persona ? dispatch.persona : {}
+  const checked = Number(persona.checked) || 0
+  if (checked <= 0) return null
+
+  const missing = Number(persona.missing) || 0
+  const withPersona = Math.max(checked - missing, 0)
+  const samples = Array.isArray(persona.samples) ? persona.samples.filter((name) => typeof name === 'string') : []
+  const detail = missing > 0 && samples.length > 0 ? `（缺：${samples.join(', ')}）` : ''
+  return `人格注入   ${withPersona}/${checked} 有 persona${detail}`
 }
 
 /**
@@ -645,7 +791,8 @@ export function analyzeSession(sessionDir, { cwd } = {}) {
 
   // 派活计数：全部来自父日志，**不依赖子会话日志是否落盘**（后者实测大多缺失）。
   // 四项里只有 subagents 能当「派过实现」的证据，其余三项只作咨询证据（见 countDispatch 注释）。
-  const dispatch = countDispatch(parentRead.events)
+  // 传 warnings 进去：人格检查要读 `arguments.prompt`，解析失败要留痕（但不计入 checked）。
+  const dispatch = countDispatch(parentRead.events, warnings)
   if (dispatch.subagents > 0 && dispatch.catalog === 0) {
     warnings.push(
       `父日志里有 ${dispatch.subagents} 次 subagent 调用但没有任何 subagent/catalog 登记，无法定位子会话日志（归因精度降级）`,
@@ -832,19 +979,30 @@ function violationDetail({ fileCount, parentEdits, dispatch = {} }) {
  *    `summon_expert` 一次性咨询不写代码、`expert_brief` 是纯函数不写盘、`subagent/catalog` 连
  *    咨询专家也会登记（`mode` 全为 `continuable`，区分不了咨询与实现）。把它们算进放行条件，
  *    「叫了专家评审、实现自己全干完」就会判 PASS —— 而那正是本工具要抓的形态。
+ * ③ **人格检查（`dispatch.persona`）只进 `warnings`，不进 `verdict`。** 它回答的是「队友 prompt
+ *    里有没有专家人格」，与「实现交给谁」正交：真实事故里三个队友命名全对、prompt 零 persona，
+ *    判定本身没有问题（确实派了人），问题在「派的质量」。把它算进放行条件会让大批历史会话判违规
+ *    （起名字容易、贴 persona 需要人主动做），闸门一上线就满地红灯、结论没人看。先让它可见。
  */
 export function judge({ files = [], parentEdits = 0, childEdits = 0, dispatch = {}, attribution = null } = {}) {
   const fileCount = Array.isArray(files) ? files.length : 0
   const subagents = Number(dispatch.subagents) || 0
 
+  // 人格检查只**追加 warning**，绝不进 verdict：判定只看 `dispatch.subagents`（见下方 ③）。
+  // 三条短路（① ② ③ 与末尾 PASS）都要带上它 —— 「队友 prompt 里没人格」与「主会话改了几个
+  // 文件」是两件正交的事，只在某一条分支里提示，换个场景就静默了（这正是这次事故的形态：
+  // 命名全对、判定也 PASS，于是没人发现人格根本没进 prompt）。
+  const personaWarning = buildPersonaWarning(dispatch)
+  const withPersona = (warnings) => (personaWarning ? [...warnings, personaWarning] : warnings)
+
   // ① ② 先短路：主会话没改 / 只改一个文件，不涉及「有没有把实现交出去」。
   if (parentEdits === 0) {
-    return { verdict: 'PASS', warnings: [], summary: 'PASS：主会话没有 edit/write' }
+    return { verdict: 'PASS', warnings: withPersona([]), summary: 'PASS：主会话没有 edit/write' }
   }
   if (fileCount <= 1) {
     return {
       verdict: 'PASS',
-      warnings: [`单文件豁免生效（改动 ${parentEdits} 次但只落在 ${fileCount} 个文件上），不判违规`],
+      warnings: withPersona([`单文件豁免生效（改动 ${parentEdits} 次但只落在 ${fileCount} 个文件上），不判违规`]),
       summary: `PASS：只改了 ${fileCount} 个文件，命中单文件豁免`,
     }
   }
@@ -856,7 +1014,7 @@ export function judge({ files = [], parentEdits = 0, childEdits = 0, dispatch = 
     const detail = violationDetail({ fileCount, parentEdits, dispatch })
     return {
       verdict: 'VIOLATION',
-      warnings: [`${detail} —— 实现没有交出去（要么派实现队友 subagent，要么把改动合回单文件）`],
+      warnings: withPersona([`${detail} —— 实现没有交出去（要么派实现队友 subagent，要么把改动合回单文件）`]),
       summary: `VIOLATION：${detail}`,
     }
   }
@@ -888,7 +1046,7 @@ export function judge({ files = [], parentEdits = 0, childEdits = 0, dispatch = 
 
   return {
     verdict: 'PASS',
-    warnings,
+    warnings: withPersona(warnings),
     summary: `PASS：${reason}；主会话跨 ${fileCount} 个文件改了 ${parentEdits} 次`,
   }
 }
@@ -920,11 +1078,21 @@ export function renderHuman(report) {
   //
   // 两行分开打印是**判据契约的一部分**：判定只看第一行（实现队友），第二行全是「咨询证据」。
   // 混成一行会让读者以为「叫了专家也算派活」，而上一版判据的失效恰恰来自这个混淆。
-  const dispatch = report.dispatch || { subagents: 0, expertCalls: 0, briefs: 0, catalog: 0 }
+  const dispatch = report.dispatch || {
+    subagents: 0,
+    expertCalls: 0,
+    briefs: 0,
+    catalog: 0,
+    persona: { checked: 0, missing: 0, samples: [] },
+  }
   const attribution = report.attribution || { childLogsFound: 0, childLogsMissing: 0, confidence: 'high' }
   lines.push('')
   lines.push(`实现队友  subagent ${dispatch.subagents}`)
   lines.push(`咨询证据  专家 ${dispatch.expertCalls} / 任务书 ${dispatch.briefs} / 子会话登记 ${dispatch.catalog}`)
+  // 人格注入这一行**不是判定的一部分**（判定只看上面第一行）；它在 checked=0（本轮没起队友）时
+  // 不打印 —— 没队友就没有「队友 prompt 带不带人格」可言，印一行 0/0 只会让人以为检查出问题。
+  const personaLine = describePersona(dispatch)
+  if (personaLine) lines.push(personaLine)
   lines.push(
     `归因精度  ${attribution.confidence}（子会话日志：找到 ${attribution.childLogsFound} 个，缺 ${attribution.childLogsMissing} 个）`,
   )

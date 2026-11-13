@@ -248,6 +248,7 @@ dispatch-check --cwd /path/to/project           # 只在这个 workspace 里找
 | `dispatch.expertCalls` | 父会话中 `summon_expert` / `summon_experts` / `summon_expert_team` 的次数 —— **咨询证据**，不构成豁免 |
 | `dispatch.briefs` | 父会话中 `expert_brief`（任务书）的次数 —— **咨询证据**（纯函数），不构成豁免 |
 | `dispatch.catalog` | 父会话中 `subagent/catalog`（子会话登记）事件数 —— 仅展示；**含咨询专家**，不构成豁免 |
+| `dispatch.persona` | `{checked, missing, samples}`：队友 prompt 里有没有专家人格 —— **只告警，不参与判定**（见下节） |
 | `attribution` | `{childLogsFound, childLogsMissing, confidence}`：子会话日志找到几个、缺几个、归因精度 |
 | `experts` / `subagents` | 旧字段（分别是专家调用数与子会话登记数），新代码请读 `dispatch.*` |
 
@@ -275,6 +276,44 @@ dispatch-check --cwd /path/to/project           # 只在这个 workspace 里找
 > 代码确实由子 agent 写」误判成「子 agent 改 0 次」。所以判据换成**父日志里必然存在的实现队友
 > 计数**（`dispatch.subagents`）；子会话日志缺失只降 `attribution.confidence`（`high` / `low`），
 > 不改变 verdict。
+
+### 人格注入检查（`dispatch.persona`，只告警、不参与判定）
+
+`dispatch.persona` 回答的是另一个问题：**队友 prompt 里到底有没有专家人格**。
+
+起因是一个真实事故：某会话给三个队友起名 `frontend-developer` / `frontend-developer-2` /
+`testing-reality-checker`（命名规则执行了），三个 prompt 里却一个 persona 字节都没有 ——
+`You are **`、`Agent Personality`、`Core Mission`、「人格」全部 0 命中，`expert_brief` 也是 0 次。
+名字对了，人以为人格也跟着进去了。
+
+判定口径（命中任一即算「有人格」）：`You are **`、`Agent Personality`、`Core Mission`、
+`Critical Rules`、`Identity`、「人格」，以及 Markdown 人格标题 `# <Name> Agent`
+（`/#\s+\w[\w ]*Agent\b/`）。这些是 persona md 与 `expert_brief` 任务书的**固定骨架**；
+放宽到「提到专家名」就会把「你是 frontend-developer」判成有人格，而名字恰恰是事故里唯一对的东西。
+
+- `checked`：能解析出 `prompt` 的 subagent 调用数。`arguments` 坏 JSON / 空串 / 缺 `prompt`
+  一律跳过并记一条 warning，但**不计入 `checked`** —— 解析不出 prompt ≠ 检查过且没人格，
+  把日志残缺说成「队友没带人格」就是编造证据。
+- `missing`：`checked` 里没命中任何标记的数量（**`prompt` 是空串也算 missing**）。
+- `samples`：缺失队友名，最多 5 个；**warning 里的缺数是真实总数**（缺 9 个时名字只列 5 个，
+  不写出真实缺数读者会以为只缺了列出来的那几个）。
+
+**它只进 `warnings` 与人类输出，绝不进 verdict。** 原因：判定若把人格缺失算进去，大量历史会话
+会被判违规（起名字容易、贴 persona 需要人主动做），一上线就是满地红灯，结论反而没人看。
+先让它可见，等「用 `expert_brief` 生成任务书」成为默认动作之后，再谈是否收紧成放行条件。
+
+人类输出多一行（**仅在 `checked > 0` 时打印**；本轮没起队友就不印 `0/0`，避免被读成检查失败）：
+
+```text
+人格注入   2/3 有 persona（缺：frontend-developer）
+人格注入   3/3 有 persona
+```
+
+`missing > 0` 时 warnings 里还有一条可执行提示：
+
+```text
+本轮 1 个队友的 prompt 里没有专家人格（缺 1 个：frontend-developer）—— 命名≠人格注入，请用 expert_brief 生成任务书或把 persona md 正文贴进 prompt
+```
 
 `attribution.confidence` 的取值：
 

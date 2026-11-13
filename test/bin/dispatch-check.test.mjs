@@ -20,6 +20,10 @@
  * 判定规则的两个方向都钉住：既验「该判 PASS 的判了 PASS」（防误报），也验
  * 「该判 VIOLATION 的判了 VIOLATION」（防漏报：把违规判成通过 = 闸门失效）。
  *
+ * `dispatch.persona`（队友 prompt 里有没有专家人格）是**独立的告警维度**：它不进 verdict，
+ * 用例既钉住「缺人格照样 PASS」（判定不被它带偏），也钉住「缺人格必须出现在 warnings 与人类
+ * 输出里」（不被静默吞掉）。真实事故里命名全对、判定 PASS，人格却一个字节都没进 prompt。
+ *
  * **判据已换锚点**：否决条件不再看 `childEdits`（实测子会话日志大多不落盘，拿它当判据会把
  * 「代码确实是子 agent 写的」误判成「子 agent 改 0 次」）。现在看的是**父日志里必然存在的派活证据**：
  * `tool/call` 的 `subagent` / `subagent_fork` / `summon_expert` / `summon_experts` /
@@ -34,6 +38,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+// 直接 import 纯函数只用于「人格标记矩阵」这一条：7 个标记走 CLI 要起 7 次子进程，
+// 而且断言只能看到聚合结果，标记漏一个也定位不到是哪条。其余用例仍走 spawnSync 端到端。
+import { hasPersona } from '../../bin/dispatch-check.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const BIN = path.resolve(HERE, '..', '..', 'bin', 'dispatch-check.mjs')
@@ -170,7 +177,13 @@ test('VIOLATION：父会话 7 文件 10 次 edit、本轮完全没派活 → 退
   assert.equal(report.parentEdits, 10)
   assert.equal(report.childEdits, 0)
   assert.equal(report.warnings.length > 0, true, '违规必须带一条人类可读的提示')
-  assert.deepEqual(report.dispatch, { subagents: 0, expertCalls: 0, briefs: 0, catalog: 0 })
+  assert.deepEqual(report.dispatch, {
+    subagents: 0,
+    expertCalls: 0,
+    briefs: 0,
+    catalog: 0,
+    persona: { checked: 0, missing: 0, samples: [] },
+  })
   assert.match(
     report.summary,
     /跨 7 个文件的主会话改动 10 次，且本轮没有任何派活记录/,
@@ -330,7 +343,13 @@ test('单文件 + 无派活 → PASS（单文件豁免优先于「没有派活�
   assert.equal(report.verdict, 'PASS')
   assert.equal(report.fileCount, 1)
   assert.equal(report.parentEdits, 4)
-  assert.deepEqual(report.dispatch, { subagents: 0, expertCalls: 0, briefs: 0, catalog: 0 })
+  assert.deepEqual(report.dispatch, {
+    subagents: 0,
+    expertCalls: 0,
+    briefs: 0,
+    catalog: 0,
+    persona: { checked: 0, missing: 0, samples: [] },
+  })
 })
 
 test('0 次 edit → PASS（即使没有任何派活记录）', () => {
@@ -690,7 +709,13 @@ test('--json：输出是合法 JSON，且带齐契约字段', () => {
   assert.equal(Array.isArray(report.warnings), true)
   assert.equal(report.files.length, report.fileCount)
 
-  assert.deepEqual(report.dispatch, { subagents: 0, expertCalls: 0, briefs: 0, catalog: 0 })
+  assert.deepEqual(report.dispatch, {
+    subagents: 0,
+    expertCalls: 0,
+    briefs: 0,
+    catalog: 0,
+    persona: { checked: 0, missing: 0, samples: [] },
+  })
   assert.deepEqual(Object.keys(report.attribution).sort(), ['childLogsFound', 'childLogsMissing', 'confidence'])
   assert.equal(['high', 'low'].includes(report.attribution.confidence), true, 'confidence 只能是 high / low')
 })
@@ -1099,4 +1124,242 @@ test('`--help` 写明 `--any-cwd`（逃生口必须能被发现）', () => {
   assert.match(res.stdout, /^\s+--any-cwd\s+\S/m, '选项表里要有一条 --any-cwd 的说明，不能只在散文里提到')
   assert.match(res.stdout, /全盘最新/, '要说明 --any-cwd 是回到「全盘最新」，不是只列个参数名')
   assert.match(res.stdout, /按当前目录匹配|当前目录/, '要说明缺省是按当前目录选会话')
+})
+
+
+// ============================================================================
+// 人格注入检查（`dispatch.persona`）：**只告警、不参与判定**
+//
+// 真实事故：三个队友叫 `frontend-developer` / `frontend-developer-2` /
+// `testing-reality-checker`（命名规则执行了），prompt 里却一个 persona 字节都没有
+// （`You are **` / `Agent Personality` / `Core Mission` / 「人格」全部 0 命中）。
+// 名字对了，人以为人格也进去了 —— 所以这一项必须可见。但它**不进 verdict**：
+// 判定若算它，大量历史会话会被判违规，先让它可见、再谈是否收紧。
+// ============================================================================
+
+/** 带专家人格骨架的 prompt（`expert_brief` 任务书 / persona md 正文的招牌字句）。 */
+const PERSONA_PROMPT = [
+  '# 代码审查工程师 Agent',
+  '',
+  '**Agent Personality**',
+  '你是代码审查工程师，负责在改动落地前挑出问题。',
+  '',
+  '## Core Mission',
+  '审查本轮改动并给出分级结论。',
+].join('\n')
+
+/** 完全没有人格痕迹的任务型 prompt —— 真实事故里的形态：可以很长，但不是 persona。 */
+const PLAIN_PROMPT = '请把 src/app/panel/Button.tsx 里的按钮文案改成「提交」，并补一条单测。'
+
+/** 一次带 prompt 的 subagent 调用；`arguments` 仍是 JSON 字符串（与真实日志一致）。 */
+function subagentCall(name, prompt, tool = 'subagent') {
+  return toolCall(tool, JSON.stringify({ name, description: 'x', prompt }))
+}
+
+test('persona 标记矩阵：七种标记任一命中即算「有人格」，普通任务文案不算', () => {
+  for (const mark of [
+    'You are **前端开发者**',
+    '**Agent Personality**',
+    '## Core Mission',
+    '## Critical Rules',
+    '## Identity',
+    '把人格正文整段贴进 prompt', // 命中「人格」二字
+    '# Code Reviewer Agent', // 命中 /#\s+\w[\w ]*Agent\b/
+  ]) {
+    assert.equal(hasPersona(mark), true, `标记 ${JSON.stringify(mark)} 应算「有人格」`)
+  }
+  assert.equal(hasPersona(PLAIN_PROMPT), false, '普通任务文案（只有文件名与要求）不算有人格')
+  assert.equal(hasPersona(''), false, '空串没人格')
+  assert.equal(hasPersona(null), false, '非字符串没人格（不能抛）')
+  assert.equal(hasPersona('## Core Mission 之外的普通标题'), true, '只要命中 Core Mission 即可，不要求整段匹配')
+})
+
+test('persona：本轮没有 subagent 调用 → 全 0、不打印「人格注入」行、无 warning', () => {
+  const root = freshRoot()
+  const { dir } = createSession({ root, uuid: 'a0000001-0000-4000-8000-000000000001', events: [edit('/p/src/a.ts')] })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  assert.deepEqual(report.dispatch.persona, { checked: 0, missing: 0, samples: [] })
+  assert.equal(
+    report.warnings.some((warning) => warning.includes('没有专家人格')),
+    false,
+    '没起队友就不该报「队友 prompt 缺人格」',
+  )
+
+  const human = run(['--session', dir], { root })
+  assert.doesNotMatch(human.stdout, /人格注入/, 'checked=0 时不打印该行（印 0/0 会被读成检查失败）')
+  assert.doesNotMatch(human.stdout, /有 persona/)
+})
+
+test('persona：arguments 坏 JSON / 空串 / 缺 prompt → 跳过不崩（不计 checked），各记一条 warning', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'a0000002-0000-4000-8000-000000000002',
+    events: [
+      toolCall('subagent', '{不是 JSON'), // 坏 JSON
+      toolCall('subagent', ''), // 空串
+      toolCall('subagent', JSON.stringify({ name: 'no-prompt' })), // 缺 prompt
+      toolCall('subagent', JSON.stringify({ name: 'num-prompt', prompt: 42 })), // prompt 非字符串
+      subagentCall('ok-persona', PERSONA_PROMPT), // 唯一一条能检查的
+    ],
+  })
+
+  const res = run(['--session', dir, '--json'], { root })
+  assert.equal(res.status, 0, `解析不了不等于违规，更不等于崩溃：${res.stderr}`)
+
+  const report = JSON.parse(res.stdout)
+  assert.equal(report.dispatch.subagents, 5, '派活计数照旧按事件数（坏 arguments 不影响「有没有派人」）')
+  assert.deepEqual(
+    report.dispatch.persona,
+    { checked: 1, missing: 0, samples: [] },
+    '解析不出 prompt 的三条不能算进 checked（那等于编造「检查过且没人格」）；prompt 非字符串也只跳过',
+  )
+  const skipped = report.warnings.filter((warning) => warning.includes('人格检查跳过'))
+  assert.equal(skipped.length, 4, `4 条无法解析的调用各应有一条说明，实际 ${skipped.length}：${report.warnings.join(' | ')}`)
+})
+
+test('persona：prompt 是空串 → 计入 checked 且算 missing（空 prompt 显然没人格）', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'a0000003-0000-4000-8000-000000000003',
+    events: [subagentCall('empty-tom', ''), subagentCall('ok-dev', PERSONA_PROMPT)],
+  })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  assert.deepEqual(report.dispatch.persona, { checked: 2, missing: 1, samples: ['empty-tom'] })
+  assert.match(
+    report.warnings.join('\n'),
+    /没有专家人格（缺 1 个：empty-tom）/,
+    '空 prompt 的队友名要出现在 warning 里',
+  )
+})
+
+test('persona：全部带人格 → checked=N、missing=0、无 warning', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'a0000004-0000-4000-8000-000000000004',
+    events: [
+      subagentCall('code-reviewer', PERSONA_PROMPT),
+      subagentCall('frontend-developer', '## Critical Rules\n只改这一个文件。', 'subagent_fork'),
+    ],
+  })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  assert.equal(report.dispatch.persona.checked, 2)
+  assert.equal(report.dispatch.persona.missing, 0)
+  assert.deepEqual(report.dispatch.persona.samples, [])
+  assert.equal(
+    report.warnings.some((warning) => warning.includes('没有专家人格')),
+    false,
+    'missing=0 时不许出现该 warning',
+  )
+})
+
+test('persona：部分缺失 → warning 带上缺失队友名，并点明「命名≠人格注入」', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'a0000005-0000-4000-8000-000000000005',
+    events: [
+      subagentCall('code-reviewer', PERSONA_PROMPT),
+      subagentCall('frontend-developer', PLAIN_PROMPT), // 名字对、prompt 没人格（事故形态）
+      subagentCall('testing-reality-checker', '**Agent Personality**\n你是验收测试工程师。'),
+    ],
+  })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  assert.equal(report.dispatch.persona.checked, 3)
+  assert.equal(report.dispatch.persona.missing, 1)
+  assert.deepEqual(report.dispatch.persona.samples, ['frontend-developer'])
+
+  const personaWarning = report.warnings.find((warning) => warning.includes('没有专家人格'))
+  assert.ok(personaWarning, 'missing>0 必须有 warning')
+  assert.match(personaWarning, /本轮 1 个队友的 prompt 里没有专家人格（缺 1 个：frontend-developer）/)
+  assert.match(personaWarning, /命名≠人格注入/, '必须点出「名字对了不代表人格进去了」这件事')
+  assert.match(personaWarning, /expert_brief/, '要给出可执行的下一步（用 expert_brief 生成任务书）')
+  assert.match(personaWarning, /persona md/, '另一条可执行的下一步：把 persona md 正文贴进 prompt')
+})
+
+test('persona：缺失超过 5 个 → samples 只留 5 个名字，但 warning 里的缺数是真实总数', () => {
+  const root = freshRoot()
+  const names = ['w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'w7']
+  const { dir } = createSession({
+    root,
+    uuid: 'a0000006-0000-4000-8000-000000000006',
+    events: names.map((name) => subagentCall(name, PLAIN_PROMPT)),
+  })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  assert.equal(report.dispatch.persona.checked, 7)
+  assert.equal(report.dispatch.persona.missing, 7)
+  assert.deepEqual(report.dispatch.persona.samples, ['w1', 'w2', 'w3', 'w4', 'w5'], 'samples 最多留 5 个')
+
+  const personaWarning = report.warnings.find((warning) => warning.includes('没有专家人格'))
+  assert.match(personaWarning, /缺 7 个/, '名字只列 5 个，缺数必须是真实的 7，否则读者以为只缺了列出来的那几个')
+})
+
+test('persona 不参与判定：复刻事故（3 个队友全无人格）→ 仍然 PASS', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'a0000007-0000-4000-8000-000000000007',
+    events: [
+      ...tenEditsOverSevenFiles(),
+      subagentCall('frontend-developer', PLAIN_PROMPT),
+      subagentCall('frontend-developer-2', '再补一个页面。'),
+      subagentCall('testing-reality-checker', '写单测。'),
+    ],
+  })
+
+  const res = run(['--session', dir, '--json'], { root })
+  assert.equal(res.status, 0, `派过实现队友就是 PASS，人格缺失不该改变 verdict：${res.stderr}`)
+
+  const report = JSON.parse(res.stdout)
+  assert.equal(report.verdict, 'PASS', '判定仍只看 dispatch.subagents')
+  assert.equal(report.dispatch.persona.checked, 3, '事故里的 3 个队友都要被检查')
+  assert.equal(report.dispatch.persona.missing, 3)
+  assert.deepEqual(report.dispatch.persona.samples, [
+    'frontend-developer',
+    'frontend-developer-2',
+    'testing-reality-checker',
+  ])
+})
+
+test('persona：人类输出「人格注入 N/M 有 persona」，部分缺失时带缺失名单', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'a0000008-0000-4000-8000-000000000008',
+    events: [
+      subagentCall('code-reviewer', PERSONA_PROMPT),
+      subagentCall('worker-b', PLAIN_PROMPT),
+    ],
+  })
+
+  const human = run(['--session', dir], { root })
+  assert.equal(human.status, 0, human.stderr)
+  assert.match(human.stdout, /^人格注入\s+1\/2 有 persona（缺：worker-b）$/m, `实际输出：${human.stdout}`)
+  // 该行必须与「实现队友」「咨询证据」同处统计块，而不是被塞进 warnings 里
+  assert.match(human.stdout, /实现队友\s+subagent 2[\s\S]*咨询证据[\s\S]*人格注入[\s\S]*归因精度/)
+  // warnings 里那条也照旧打印（一眼看到「命名≠人格注入」的处置建议）
+  assert.match(human.stdout, /命名≠人格注入/)
+})
+
+test('persona：人类输出在全部带人格时是「3/3 有 persona」且不带省略名单', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'a0000009-0000-4000-8000-000000000009',
+    events: [
+      subagentCall('a1', PERSONA_PROMPT),
+      subagentCall('a2', PERSONA_PROMPT),
+      subagentCall('a3', PERSONA_PROMPT),
+    ],
+  })
+
+  const human = run(['--session', dir], { root })
+  assert.match(human.stdout, /^人格注入\s+3\/3 有 persona$/m, `实际输出：${human.stdout}`)
 })
