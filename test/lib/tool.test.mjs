@@ -30,7 +30,7 @@ let apply = null
 let inject = null
 let pluginName = null
 try {
-  const indexModule = await import('../lib/index.js')
+  const indexModule = await import('../../lib/index.js')
   ;({ apply, inject, name: pluginName } = indexModule)
 } catch {
   apply = null
@@ -39,8 +39,8 @@ try {
 }
 const NO_HOST = pluginName === null ? '需宿主 @deepseek-ai/dsh-tools，纯 node 环境跳过' : false
 
-import { buildBrief } from '../lib/brief.mjs'
-import { PersonaError, resolvePersona } from '../lib/persona.mjs'
+import { buildBrief } from '../../lib/brief.mjs'
+import { PersonaError, resolvePersona } from '../../lib/persona.mjs'
 import {
   DEFAULT_WORKER,
   TOOL_ERROR_CODES,
@@ -48,11 +48,11 @@ import {
   ToolSpecError,
   buildToolSpec,
   executeExpertBrief,
-} from '../lib/tool.mjs'
+} from '../../lib/tool.mjs'
 
 /** 包的根目录与 CLI 路径，全部由本文件位置推导（不写死绝对路径）。 */
 const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
-const CLI_PATH = fileURLToPath(new URL('../bin/expert-brief.mjs', import.meta.url))
+const CLI_PATH = fileURLToPath(new URL('../../bin/expert-brief.mjs', import.meta.url))
 
 const VERIFY = 'node --test dsh-expert-team-kit/test/'
 const TASK = '实现第 3 层：工具规格 + 插件入口 + CLI。'
@@ -592,7 +592,7 @@ test('execute: 同参数多次调用产出逐字节相同（纯函数，无隐�
 })
 
 test('依赖方向: lib/tool.mjs、bin/expert-brief.mjs 不 import 宿主包（index.js 例外）', () => {
-  const files = ['../lib/tool.mjs', '../bin/expert-brief.mjs']
+  const files = ['../../lib/tool.mjs', '../../bin/expert-brief.mjs']
 
   for (const relative of files) {
     const source = fs.readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8')
@@ -612,7 +612,7 @@ test('依赖方向: lib/tool.mjs、bin/expert-brief.mjs 不 import 宿主包（i
   }
 
   // 插件入口必须用宿主 defineTool：裸对象塞进 ctx.tools.register 不会出现在工具表里
-  const indexSource = fs.readFileSync(fileURLToPath(new URL('../lib/index.js', import.meta.url)), 'utf8')
+  const indexSource = fs.readFileSync(fileURLToPath(new URL('../../lib/index.js', import.meta.url)), 'utf8')
   assert.match(
     indexSource,
     /import \{ defineTool \} from '@deepseek-ai\/dsh-tools'/,
@@ -682,7 +682,7 @@ test('lib/index.js: ctx 缺 tools.register 时直接抛可操作错误，而不�
 })
 
 test('回归: index.js 不得解构 tools.register（会丢 this，注册表抛 layers 未定义）', () => {
-  const source = fs.readFileSync(fileURLToPath(new URL('../lib/index.js', import.meta.url)), 'utf8')
+  const source = fs.readFileSync(fileURLToPath(new URL('../../lib/index.js', import.meta.url)), 'utf8')
 
   // 真实注册表内部读 this.layers：把 register 解构出来再调用会抛
   // "Cannot read properties of undefined (reading 'layers')"，而该异常被 cordis

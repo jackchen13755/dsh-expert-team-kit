@@ -12,7 +12,7 @@ import {
   parsePersonaFile,
   personaRoot,
   resolvePersona,
-} from '../lib/persona.mjs'
+} from '../../lib/persona.mjs'
 
 /** 临时改 env，跑完必须还原（测试进程内不互相污染）。 */
 function withEnv(name, value, fn) {

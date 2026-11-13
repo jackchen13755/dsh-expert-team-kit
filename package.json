@@ -5,7 +5,8 @@
   "type": "module",
   "main": "./lib/index.js",
   "bin": {
-    "expert-brief": "./bin/expert-brief.mjs"
+    "expert-brief": "./bin/expert-brief.mjs",
+    "dispatch-check": "./bin/dispatch-check.mjs"
   },
   "exports": {
     ".": "./lib/index.js",

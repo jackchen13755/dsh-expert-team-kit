@@ -211,6 +211,101 @@ expert-brief --expert code-reviewer \
 - `--help` / `-h` 优先于其它选项（即使别的参数有错也只打印用法，退出 0）。
 - 选项清单以 `expert-brief --help` 为准。
 
+## 改动归属自检（`dispatch-check`）
+
+与上面四层**互相独立**的一个诊断 CLI：读 DSH 会话日志，回答「本轮的 `edit`/`write` 到底是谁执行的」。
+
+要解决的失效形态是**假合规**：主 agent 叫了专家做评审，代码实现却仍自己干完。
+交付说明里只写「用了哪些专家」看不出这一层，只能从会话日志的事实事后核对。
+
+所以判据的锚点是「**有没有派过实现队友**」，而不是「有没有叫过人」：
+
+- `summon_expert` / `summon_experts` / `summon_expert_team` 是**一次性咨询**，不写代码；
+- `expert_brief` 是**纯函数**（只生成任务书文本，不写盘）；
+- `subagent/catalog` 只是「子会话登记」，而且**包含咨询专家** —— 实测 `summon_expert` 起的
+  `agent-*` 与 `subagent` 起的 `worker-*` 在 catalog 里**全是 `mode: "continuable"`**，该字段
+  区分不了咨询与实现（日志里另有 `mode: "normal" / "workspace-write" / …`，那是**沙箱模式**，
+  与子会话无关）。
+
+这三项一律只当**咨询证据**：照常计数、进文案，但**不构成豁免**。把它们算进放行条件，「叫了专家
+评审、实现自己全干完」就会判 PASS —— 那正是本工具要抓的形态。
+
+```bash
+dispatch-check                                  # 最近一次会话
+dispatch-check --session <uuid>                 # 指定会话（支持 uuid 前缀）
+dispatch-check --session <会话目录> --json      # 直接给目录，输出 JSON
+dispatch-check --cwd /path/to/project           # 只在这个 workspace 里找
+```
+
+统计口径：
+
+| 字段 | 含义 |
+| --- | --- |
+| `files` | 父会话 + 所有子会话里 `edit`/`write` 涉及的 `file_path` 去重集合 |
+| `parentEdits` | 父会话中 `edit` + `write` 的次数 |
+| `childEdits` | 所有子会话中 `edit` + `write` 的次数之和（**只作归因参考，不参与判定**） |
+| `dispatch.subagents` | 父会话中 `subagent` + `subagent_fork` 的次数 —— **唯一有资格当「派过实现」的证据** |
+| `dispatch.expertCalls` | 父会话中 `summon_expert` / `summon_experts` / `summon_expert_team` 的次数 —— **咨询证据**，不构成豁免 |
+| `dispatch.briefs` | 父会话中 `expert_brief`（任务书）的次数 —— **咨询证据**（纯函数），不构成豁免 |
+| `dispatch.catalog` | 父会话中 `subagent/catalog`（子会话登记）事件数 —— 仅展示；**含咨询专家**，不构成豁免 |
+| `attribution` | `{childLogsFound, childLogsMissing, confidence}`：子会话日志找到几个、缺几个、归因精度 |
+| `experts` / `subagents` | 旧字段（分别是专家调用数与子会话登记数），新代码请读 `dispatch.*` |
+
+判定（从上到下，命中即停）：
+
+- **PASS**：① `parentEdits === 0`（主会话没改）；② `files.length <= 1`（单文件豁免）；
+  ③ 跨多个文件且主会话改过，但 `dispatch.subagents > 0`（**真派过实现队友**）。
+- **VIOLATION**：跨 `>= 2` 个文件的主会话改动 `> 0` 次，且 `dispatch.subagents === 0`。
+  文案分两种情况，读者一眼能分清：
+  - 只叫过咨询（`expertCalls + briefs + catalog > 0`）→
+    「本轮只叫了 K 次专家/生成 J 份任务书，但没有任何实现队友（subagent 0 次）——『叫了评审，实现仍自己干』」；
+  - 一项都没有 → 「本轮没有任何派活记录」。
+- 其余情况（理论到不了）：PASS + warning。
+
+> **VIOLATION 条件只依赖 `dispatch.subagents` 一个计数。** `childEdits` / `expertCalls` / `briefs` /
+> `catalog` 都不得出现在放行条件里：前者日志大多不落盘（拿它否决会误杀真交付），后三者是
+> **咨询证据**（拿它放行会让「叫了专家评审、实现自己全干完」蒙混过关）。
+
+> 判定针对**主会话**。会话本身是子 agent 会话时（`session.delegationDepth > 0`，如直接
+> `--session <某个 session-* 子会话目录>`），报告里会标出 `delegationDepth` / `origin`，此时
+> 结论只作归因参考 —— 子 agent 自己改代码正是本职。
+
+> **`childEdits` 没有否决权，也没有豁免权。** 实测子会话日志大多不落盘（某机器上派了 12 个子
+> agent、磁盘只有 1 个子会话目录；另一个会话派了 2 个、0 个落盘），拿它当否决判据会把「723 行
+> 代码确实由子 agent 写」误判成「子 agent 改 0 次」。所以判据换成**父日志里必然存在的实现队友
+> 计数**（`dispatch.subagents`）；子会话日志缺失只降 `attribution.confidence`（`high` / `low`），
+> 不改变 verdict。
+
+`attribution.confidence` 的取值：
+
+- `high`：子会话日志全找到；或本轮压根没起子会话（没有需要归因的东西）。
+- `low`：有 `subagent/catalog` 登记但日志缺失，或调过 `subagent` 却没有 catalog 登记 ——
+  此时 `childEdits` 只可能偏小，warnings 会写明「派过活但子会话日志不可用，无法核实执行占比」。
+
+退出码即契约，CI 只看它：`0` = PASS、`2` = 违规、`1` = 出错（找不到会话 / 参数错 / 日志不可读）。
+`--help` 打印用法并退出 `0`；`--json` 只输出一份 JSON（带 `verdict` / `files` / `parentEdits` /
+`childEdits` / `dispatch` / `attribution` / `warnings` 等字段）。人类输出把计数**分成两行**
+（判定只看第一行，第二行全是咨询证据，混成一行会让人误以为叫专家也算派活）：
+
+```text
+实现队友  subagent N
+咨询证据  专家 M / 任务书 K / 子会话登记 J
+```
+
+随后是一行 `归因精度`（`high` / `low`）与子会话明细。
+
+两个实现事实值得知道：
+
+- **子会话要单独读，且目录名有两种形态**：父日志里只有 `subagent/catalog`（登记 `childId`），
+  子 agent 的 `tool/call` 记在**同 workspace** 下的兄弟目录：老布局 `session-<childId>`、
+  新布局直接是 `<childId>`（实测父会话是 `session-*`、子会话是裸 uuid）。两种都找不到才算
+  「日志缺失」。漏读它就等于「队友改了也是 0 次」。
+- **两种日志格式都吃**：真实日志是 `session.v4.jsonl.zstd`，用 `zstd -dc` 子进程解压（需要本机有
+  `zstd`）；没有压缩文件时读普通 `session.jsonl`。后者是测试与二次分发用的路径，所以测试不依赖真机数据。
+- `tool/call` 的 `arguments` 是**字符串**，要二次 `JSON.parse`；坏 JSON / 空串 / 缺 `file_path`
+  一律跳过并写进 `warnings`，不让一次坏事件把整份报告打成异常。
+- 会话根可用 `DSH_SESSIONS_DIR` 覆盖（缺省 `~/.dsh/sessions`），测试与多 `DSH_HOME` 场景用。
+
 ## 错误处理约定
 
 - 人格问题一律 `PersonaError`（`code` 可分支），任务书参数问题抛 `Error`（同样带 `code`，

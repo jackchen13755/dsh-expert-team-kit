@@ -1,8 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { buildBrief } from '../lib/brief.mjs'
-import { PersonaError, resolvePersona } from '../lib/persona.mjs'
+import { buildBrief } from '../../lib/brief.mjs'
+import { PersonaError, resolvePersona } from '../../lib/persona.mjs'
 
 const VERIFY = 'node --test dsh-expert-team-kit/test/'
 const TASK = '在 dsh-expert-team-kit 下实现 persona 解析与任务书生成。'
