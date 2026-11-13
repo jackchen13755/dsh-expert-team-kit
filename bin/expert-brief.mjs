@@ -26,6 +26,7 @@ import { executeExpertBrief } from '../lib/tool.mjs'
 const USAGE = `用法：
   expert-brief --expert <slug> (--task <text> | --task-file <path>) --verify <cmd>
                [--scope <prefix>]... [--task-id <id>] [--worker <name>]
+               [--surface <none|official|agent-teams>] [--kind <implementation|review|work>]
 
 给指定专家生成一份可直接派给 teammate 的自包含任务书（打印到 stdout）。
 
@@ -40,18 +41,35 @@ const USAGE = `用法：
   --scope <prefix>       允许修改的文件前缀，可重复多次；不给表示未限定作用域
   --task-id <id>         任务板 id（如 task-8），任务书流程与回报第 4 行会引用它
   --worker <name>        队友名，默认 worker
+  --surface <name>       任务书第 5 节生成的收尾协议，三选一：
+                         none（默认，不生成任何任务板调用，只按回报格式收尾）
+                         official（team_task_get / team_task_update 的 claim + complete）
+                         agent-teams（agent_teams_claim_task / agent_teams_complete_task，带 attempt_id）
+                         给别的值会报错，不会静默退回 none
+  --kind <type>          任务字段里的交付类型，默认 implementation；可选 review / work
   -h, --help             打印本用法并退出 0
                          （优先于其它选项：即使同时给了别的参数或它们有错，也只打印用法）
 
 示例：
   expert-brief --expert code-reviewer --task "审查 lib/tool.mjs" \\
     --verify "node --test dsh-expert-team-kit/test/" \\
-    --scope dsh-expert-team-kit/lib/tool.mjs --task-id task-8 --worker worker-tool
+    --scope dsh-expert-team-kit/lib/tool.mjs --task-id task-8 --worker worker-tool \\
+    --surface official --kind review
 
 退出码：0 成功（stdout 是任务书）；1 参数错误或生成失败（原因写到 stderr）。`
 
 /** 需要取值的参数（`--key value` / `--key=value` 两种写法都认）。 */
-const VALUE_FLAGS = new Set(['expert', 'task', 'task-file', 'verify', 'scope', 'task-id', 'worker'])
+const VALUE_FLAGS = new Set([
+  'expert',
+  'task',
+  'task-file',
+  'verify',
+  'scope',
+  'task-id',
+  'worker',
+  'surface',
+  'kind',
+])
 
 /**
  * `--help` / `-h`：优先级最高，先扫一遍再解析（见文件头 N3）。
@@ -80,12 +98,13 @@ class CliError extends Error {
  * @param {string[]} argv
  * @returns {{
  *   expert?: string, task?: string, taskFile?: string, verify?: string,
- *   scopes: string[], taskId?: string, worker?: string, help: boolean,
+ *   scopes: string[], taskId?: string, worker?: string, surface?: string, kind?: string,
+ *   help: boolean,
  * }}
  * @throws {CliError} 未知参数 / 参数缺值 / 位置参数 / --task 与 --task-file 同给
  */
 function parseArgv(argv) {
-  /** @type {{ expert?: string, task?: string, taskFile?: string, verify?: string, scopes: string[], taskId?: string, worker?: string, help: boolean }} */
+  /** @type {{ expert?: string, task?: string, taskFile?: string, verify?: string, scopes: string[], taskId?: string, worker?: string, surface?: string, kind?: string, help: boolean }} */
   const parsed = { scopes: [], help: false }
 
   // N3：--help 优先。先整体扫一遍再解析，避免「--help --nope」被参数错误抢先中断。
@@ -196,6 +215,8 @@ function toToolArgs(parsed) {
     scopes: parsed.scopes,
     task_id: parsed.taskId,
     worker: parsed.worker,
+    surface: parsed.surface,
+    kind: parsed.kind,
   }
 
   if (parsed.task === undefined && parsed.taskFile !== undefined) {

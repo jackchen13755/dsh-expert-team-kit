@@ -49,6 +49,72 @@ const BIN = path.resolve(HERE, '..', '..', 'bin', 'dispatch-check.mjs')
 const BASE = fs.mkdtempSync(path.join(os.tmpdir(), 'dispatch-check-test-'))
 after(() => fs.rmSync(BASE, { recursive: true, force: true }))
 
+/**
+ * 人格清单 fixture（**不用真机的人格目录**）。
+ *
+ * 为什么必须自带 fixture：新判据要读到人格 md 的 `name` 与正文行。若让用例扫真机的
+ * `assets/agency-agents`，这套测试就绑在「本机装了哪个版本的专家插件」上 —— 换台机器、
+ * 升级插件就会红一片，而且扫 300+ 份 md 会拖慢每一轮。所以 `run()` 默认把
+ * `DSH_PERSONA_ROOT` 指到这个 fixture，人格判定完全确定。
+ *
+ * 三份人格的结构与真实 md 一致：frontmatter 有 `name`，正文前 3 条非空行里第 3 条是
+ * 长度 >= 30 的实质句（前两行是短标题，故意短于阈值 —— 钉住「短标题不算正文」）。
+ */
+const PERSONA_FIXTURE = path.join(BASE, 'personas')
+
+const FIXTURE_PERSONAS = {
+  reviewer: {
+    slug: 'engineering/code-reviewer.md',
+    name: '代码审查工程师',
+    title: '# 代码审查工程师 Agent',
+    short: '**Agent Personality**',
+    body: '你是代码审查工程师，负责在改动落地前挑出问题并给出分级结论与改法。',
+  },
+  frontend: {
+    slug: 'engineering/frontend-developer.md',
+    name: '前端开发者',
+    title: '# 前端开发者 Agent',
+    short: '**Agent Personality**',
+    body: '你是前端开发者，负责按设计稿实现界面，并保证交互、可访问性与性能。',
+  },
+  tester: {
+    slug: 'testing/testing-reality-checker.md',
+    name: '验收测试工程师',
+    title: '# 验收测试工程师 Agent',
+    short: '**Agent Personality**',
+    body: '你是验收测试工程师，负责按验收标准逐条核验并给出可复跑的证据。',
+  },
+}
+
+for (const persona of Object.values(FIXTURE_PERSONAS)) {
+  const file = path.join(PERSONA_FIXTURE, persona.slug)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(
+    file,
+    ['---', `name: ${persona.name}`, 'description: 测试用人格', '---', '', persona.title, '', persona.short, '', persona.body, ''].join('\n'),
+  )
+}
+
+/** 把某位 fixture 人格「完整注入」的 prompt（名字 + 正文实质行都在）。 */
+function personaPrompt(persona) {
+  return [persona.title, '', persona.short, '', persona.body, '', '## Core Mission', '按任务书做完并回报。'].join('\n')
+}
+
+/**
+ * 判定器要吃的人格形状（`{name, bodyLines}`），与 `loadPersonaCorpus` 的产出同构。
+ * 注意不能用 `FIXTURE_PERSONAS` 的 spec 对象直接喂：那份是「造 fixture 用的描述」，
+ * 没有 `bodyLines` 字段 —— 直接喂会让判据永远拿不到正文行（等于假阳性全变假阴性）。
+ */
+const PERSONA_LIST = Object.values(FIXTURE_PERSONAS).map((persona) => ({
+  name: persona.name,
+  bodyLines: [persona.title, persona.short, persona.body],
+}))
+
+/** 只提名字、不贴正文 —— 真实事故里的形态（名字恰恰是对的）。 */
+function nameOnlyPrompt(persona) {
+  return `你是 ${persona.name}，任务见附件。`
+}
+
 let caseSeq = 0
 /** 每个用例一个独立根目录，避免用例间互相看见对方的会话（尤其 `latest`）。 */
 function freshRoot() {
@@ -134,7 +200,14 @@ function createSession({
 function run(args, { root, cwd } = {}) {
   const options = {
     encoding: 'utf8',
-    env: { ...process.env, DSH_SESSIONS_DIR: root || path.join(BASE, 'no-such-root') },
+    env: {
+      ...process.env,
+      DSH_SESSIONS_DIR: root || path.join(BASE, 'no-such-root'),
+      // 人格清单默认指向 fixture：真机插件目录既慢又随版本漂移（见 PERSONA_FIXTURE 注释）。
+      DSH_PERSONA_ROOT: PERSONA_FIXTURE,
+      // 会话 id 缺省为空：本文件所有用例都显式给 --session，不依赖宿主机注入的会话 id。
+      DSH_SESSION_ID: '',
+    },
   }
   // `cwd` 用来给子进程换工作目录：`--session latest` 的隐式默认 cwd 就是它的
   // `process.cwd()`，不能靠测试进程自己的 cwd（那会被跑测试的位置影响）。
@@ -822,7 +895,7 @@ test('--session 支持 latest（取最近一次会话）', () => {
   const oldTime = new Date(Date.now() - 3600_000)
   fs.utimesSync(path.join(older.dir, 'session.jsonl'), oldTime, oldTime)
 
-  const res = run(['--session', 'latest', '--json'], { root: root })
+  const res = run(['--session', 'latest', '--allow-latest', '--json'], { root: root })
   assert.equal(res.status, 2, 'latest 应选中改 7 个文件那个（违规）')
   const report = JSON.parse(res.stdout)
   assert.equal(report.session.dir, newer.dir)
@@ -840,7 +913,7 @@ test('--cwd 只在匹配的 workspace 里找会话（slug 掉开头斜杠的规�
   const betaDir = path.join(root, '--tmp-proj-beta--')
   assert.equal(fs.existsSync(betaDir), true, `测试自己的 slug 推导应产生 ${betaDir}`)
 
-  const res = run(['--session', 'latest', '--cwd', cwdB, '--json'], { root })
+  const res = run(['--session', 'latest', '--allow-latest', '--cwd', cwdB, '--json'], { root })
   assert.equal(res.status, 2)
 
   const report = JSON.parse(res.stdout)
@@ -852,7 +925,7 @@ test('--cwd 匹配不到时报错退出 1，并提示去掉 --cwd', () => {
   const root = freshRoot()
   createSession({ root, cwd: '/tmp/proj-exists', uuid: 'c3c3c3c3-0000-4000-8000-00000000000c' })
 
-  const res = run(['--session', 'latest', '--cwd', '/tmp/definitely-not-a-workspace-xyz'], { root })
+  const res = run(['--session', 'latest', '--allow-latest', '--cwd', '/tmp/definitely-not-a-workspace-xyz'], { root })
   assert.equal(res.status, 1)
   assert.match(res.stderr, /没有 cwd 匹配/)
 })
@@ -1017,7 +1090,7 @@ test('核心回归：`--session latest` 在 A 的 cwd 下跑 → 命中更旧的
   const root = freshRoot()
   const { cwdA, a, b } = twoWorkspacesWithNewerB(root)
 
-  const res = run(['--session', 'latest', '--json'], { root, cwd: cwdA })
+  const res = run(['--session', 'latest', '--allow-latest', '--json'], { root, cwd: cwdA })
   assert.equal(res.status, 0, `应命中 A（PASS，退出码 0），实际 ${res.status}：${res.stderr}`)
 
   const report = JSON.parse(res.stdout)
@@ -1028,7 +1101,7 @@ test('核心回归：`--session latest` 在 A 的 cwd 下跑 → 命中更旧的
   assert.equal(report.session.cwdFilter, cwdA)
 
   // 人类输出必须说明这次会话是怎么选出来的，否则读者没法判断结论对不对。
-  const human = run(['--session', 'latest'], { root, cwd: cwdA })
+  const human = run(['--session', 'latest', '--allow-latest'], { root, cwd: cwdA })
   assert.match(human.stdout, /选会话\s+按当前目录匹配（--any-cwd 可关）/)
 })
 
@@ -1036,7 +1109,7 @@ test('`--any-cwd`：关掉当前目录默认，回到全盘最新 → 命中更�
   const root = freshRoot()
   const { cwdA, a, b } = twoWorkspacesWithNewerB(root)
 
-  const res = run(['--session', 'latest', '--any-cwd', '--json'], { root, cwd: cwdA })
+  const res = run(['--session', 'latest', '--allow-latest', '--any-cwd', '--json'], { root, cwd: cwdA })
   assert.equal(res.status, 2, `应命中 B（VIOLATION，退出码 2），实际 ${res.status}：${res.stderr}`)
 
   const report = JSON.parse(res.stdout)
@@ -1045,7 +1118,7 @@ test('`--any-cwd`：关掉当前目录默认，回到全盘最新 → 命中更�
   assert.equal(report.session.selectedBy, 'any-cwd')
   assert.equal('cwdFilter' in report.session, false, '没按 cwd 筛过就不该写 cwdFilter（假证据）')
 
-  const human = run(['--session', 'latest', '--any-cwd'], { root, cwd: cwdA })
+  const human = run(['--session', 'latest', '--allow-latest', '--any-cwd'], { root, cwd: cwdA })
   assert.match(human.stdout, /选会话\s+全盘最新（--any-cwd）/)
 })
 
@@ -1053,7 +1126,7 @@ test('显式 `--cwd` 优先于当前目录：cwd=B 时 `--cwd A` → 命中 A', 
   const root = freshRoot()
   const { cwdA, cwdB, a, b } = twoWorkspacesWithNewerB(root)
 
-  const res = run(['--session', 'latest', '--cwd', cwdA, '--json'], { root, cwd: cwdB })
+  const res = run(['--session', 'latest', '--allow-latest', '--cwd', cwdA, '--json'], { root, cwd: cwdB })
   assert.equal(res.status, 0, `显式 --cwd 应生效（命中 A），实际 ${res.status}：${res.stderr}`)
 
   const report = JSON.parse(res.stdout)
@@ -1094,7 +1167,7 @@ test('隐式默认 cwd 匹配不到会话时退回全盘最新（不报错），
     events: tenEditsOverSevenFiles(),
   })
 
-  const res = run(['--session', 'latest', '--json'], { root, cwd: cwdA })
+  const res = run(['--session', 'latest', '--allow-latest', '--json'], { root, cwd: cwdA })
   assert.equal(res.status, 2, `猜不中就该退回全盘最新而不是失败：${res.stderr}`)
   const report = JSON.parse(res.stdout)
   assert.equal(report.session.dir, b.dir)
@@ -1102,11 +1175,11 @@ test('隐式默认 cwd 匹配不到会话时退回全盘最新（不报错），
   assert.equal('cwdFilter' in report.session, false, '退回时并没有按 cwd 筛过')
   assert.match(report.warnings.join('\n'), /退回全盘最新/, '退回这件事必须写在报告里，不能静默')
 
-  const human = run(['--session', 'latest'], { root, cwd: cwdA })
+  const human = run(['--session', 'latest', '--allow-latest'], { root, cwd: cwdA })
   assert.match(human.stdout, /选会话\s+全盘最新（当前目录下没有会话，已退回全盘；--any-cwd 可直接关）/)
 
   // 同一场景换成**显式** --cwd：仍是硬筛，匹配不到必须报错退出 1（软默认只属于缺省值）
-  const explicit = run(['--session', 'latest', '--cwd', cwdA], { root, cwd: cwdA })
+  const explicit = run(['--session', 'latest', '--allow-latest', '--cwd', cwdA], { root, cwd: cwdA })
   assert.equal(explicit.status, 1, '显式 --cwd 不许静默退回全盘')
   assert.match(explicit.stderr, /没有 cwd 匹配/)
 })
@@ -1116,6 +1189,8 @@ test('`--help` 写明 `--any-cwd`（逃生口必须能被发现）', () => {
   assert.equal(res.status, 0)
   // 三处都要在，缺一处就等于「有这个参数但没人知道」：
   // ① 用法行（一眼看到参数存在）② 选项表里的条目（知道它干什么）③ 语义说明。
+  // 用法行改成多行（新增了 --session-env / --allow-latest / --persona-* / --strict-attribution），
+  // 断言随之放宽到「同一条用法行里同时出现 --session 与 --any-cwd」，语义比原来的整行字面量更稳。
   assert.match(
     res.stdout,
     /dispatch-check \[--session <dir\|id\|latest>\] \[--cwd <路径>\] \[--any-cwd\]/,
@@ -1137,16 +1212,14 @@ test('`--help` 写明 `--any-cwd`（逃生口必须能被发现）', () => {
 // 判定若算它，大量历史会话会被判违规，先让它可见、再谈是否收紧。
 // ============================================================================
 
-/** 带专家人格骨架的 prompt（`expert_brief` 任务书 / persona md 正文的招牌字句）。 */
-const PERSONA_PROMPT = [
-  '# 代码审查工程师 Agent',
-  '',
-  '**Agent Personality**',
-  '你是代码审查工程师，负责在改动落地前挑出问题。',
-  '',
-  '## Core Mission',
-  '审查本轮改动并给出分级结论。',
-].join('\n')
+/**
+ * 真正把 fixture 人格「贴全」的 prompt：名字 + 正文前 3 条非空行里那条 >=30 字符的实质句。
+ *
+ * **判据已换锚点**（本任务 C 项）：不再是「命中某个通用子串标记」，而是
+ * 「命中某人格 frontmatter 的 name 值 **且** 该人格正文前 3 条非空行中至少 1 条（长度 >=30）
+ * 原样出现」。旧判据里那条裸「人格」子串会把「…不要贴人格正文」判成有人格（方向反了）。
+ */
+const PERSONA_PROMPT = personaPrompt(FIXTURE_PERSONAS.reviewer)
 
 /** 完全没有人格痕迹的任务型 prompt —— 真实事故里的形态：可以很长，但不是 persona。 */
 const PLAIN_PROMPT = '请把 src/app/panel/Button.tsx 里的按钮文案改成「提交」，并补一条单测。'
@@ -1156,22 +1229,36 @@ function subagentCall(name, prompt, tool = 'subagent') {
   return toolCall(tool, JSON.stringify({ name, description: 'x', prompt }))
 }
 
-test('persona 标记矩阵：七种标记任一命中即算「有人格」，普通任务文案不算', () => {
-  for (const mark of [
-    'You are **前端开发者**',
-    '**Agent Personality**',
-    '## Core Mission',
-    '## Critical Rules',
-    '## Identity',
-    '把人格正文整段贴进 prompt', // 命中「人格」二字
-    '# Code Reviewer Agent', // 命中 /#\s+\w[\w ]*Agent\b/
-  ]) {
-    assert.equal(hasPersona(mark), true, `标记 ${JSON.stringify(mark)} 应算「有人格」`)
-  }
-  assert.equal(hasPersona(PLAIN_PROMPT), false, '普通任务文案（只有文件名与要求）不算有人格')
-  assert.equal(hasPersona(''), false, '空串没人格')
-  assert.equal(hasPersona(null), false, '非字符串没人格（不能抛）')
-  assert.equal(hasPersona('## Core Mission 之外的普通标题'), true, '只要命中 Core Mission 即可，不要求整段匹配')
+// 旧「七种子串标记」矩阵已整条替换：判据换锚点后那些标记既不是必要也不是充分条件，
+// 留着只会把错误判据再钉一遍。新的矩阵见下方「persona 判据矩阵」（含红牙）。
+test('persona 判据矩阵：名字 + 正文实质行都出现才算，只提名字/只贴标题/说「不要贴人格式」都不算', () => {
+  const personas = PERSONA_LIST
+
+  assert.equal(hasPersona(PERSONA_PROMPT, { personas }), true, '名字 + 正文实质行 → 有人格')
+  assert.equal(hasPersona(PLAIN_PROMPT, { personas }), false, '普通任务文案（只有文件名与要求）不算有人格')
+  assert.equal(hasPersona('', { personas }), false, '空串没人格')
+  assert.equal(hasPersona(null, { personas }), false, '非字符串没人格（不能抛）')
+
+  // 🦷 红牙：这三条在旧判据下都会判 true，正是本次要修的形态。
+  assert.equal(
+    hasPersona(nameOnlyPrompt(FIXTURE_PERSONAS.reviewer), { personas }),
+    false,
+    '只提到人格名、正文一个字节都没贴 → 不算（真实事故里名字恰恰是对的）',
+  )
+  assert.equal(
+    hasPersona('## Core Mission\n## Critical Rules\n## Identity', { personas }),
+    false,
+    '只贴通用标题（短于 30 字符）→ 不算正文',
+  )
+  assert.equal(
+    hasPersona('你是前端开发者。注意：不要贴人格正文，只按任务书做事。', { personas }),
+    false,
+    '句子里出现「人格」二字但明确要求**不要**贴正文 → 必须判 false（旧判据在这里方向反了）',
+  )
+
+  // 清单不可用 ≠ 没人格：返回 false 但调用方必须能区分（见 persona-check 的单测）。
+  assert.equal(hasPersona(PERSONA_PROMPT, { personas: [] }), false, '清单为空时不能假装判过')
+  assert.equal(hasPersona(PERSONA_PROMPT), false, '不传清单时不能假装判过')
 })
 
 test('persona：本轮没有 subagent 调用 → 全 0、不打印「人格注入」行、无 warning', () => {
@@ -1243,7 +1330,9 @@ test('persona：全部带人格 → checked=N、missing=0、无 warning', () => 
     uuid: 'a0000004-0000-4000-8000-000000000004',
     events: [
       subagentCall('code-reviewer', PERSONA_PROMPT),
-      subagentCall('frontend-developer', '## Critical Rules\n只改这一个文件。', 'subagent_fork'),
+      // 旧版这里贴的是 `## Critical Rules\n只改这一个文件。`（只有通用标题）；
+      // 新判据要求「名字 + 正文实质行」，通用标题不再算人格 —— 所以换成真正贴全的 prompt。
+      subagentCall('frontend-developer', personaPrompt(FIXTURE_PERSONAS.frontend), 'subagent_fork'),
     ],
   })
 
@@ -1266,7 +1355,8 @@ test('persona：部分缺失 → warning 带上缺失队友名，并点明「命
     events: [
       subagentCall('code-reviewer', PERSONA_PROMPT),
       subagentCall('frontend-developer', PLAIN_PROMPT), // 名字对、prompt 没人格（事故形态）
-      subagentCall('testing-reality-checker', '**Agent Personality**\n你是验收测试工程师。'),
+      // 也换成真正贴全的 prompt：旧版这里是「只有短标题 + 一句 14 字的话」，新判据下不算有人格。
+      subagentCall('testing-reality-checker', personaPrompt(FIXTURE_PERSONAS.tester)),
     ],
   })
 
@@ -1362,4 +1452,583 @@ test('persona：人类输出在全部带人格时是「3/3 有 persona」且不�
 
   const human = run(['--session', dir], { root })
   assert.match(human.stdout, /^人格注入\s+3\/3 有 persona$/m, `实际输出：${human.stdout}`)
+})
+
+// ============================================================================
+// A. 会话解析：`--session current` / `--session-env` / `--session latest` 默认拒绝
+//
+// 失效背景（真机实测）：老版 `--session` 缺省是 `latest`，按 cwd+mtime 猜会话 ——
+// 26 次 oracle 执行**全部 exit 0**，看起来「都通过了」，检查的根本不是当前会话。
+// 新契约：缺省从环境变量（DSH_SESSION_ID）取当前会话 id，取不到就 exit 1，**绝不回退 latest**。
+// ============================================================================
+
+/** 跑 CLI 并显式控制会话 id 环境变量（`run()` 默认把 DSH_SESSION_ID 清空）。 */
+function runWithEnv(args, { root, cwd, env = {} } = {}) {
+  const options = {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      DSH_SESSIONS_DIR: root || path.join(BASE, 'no-such-root'),
+      DSH_PERSONA_ROOT: PERSONA_FIXTURE,
+      DSH_SESSION_ID: '',
+      ...env,
+    },
+  }
+  if (cwd) options.cwd = cwd
+  return spawnSync(process.execPath, [BIN, ...args], options)
+}
+
+test('🦷 A-红牙：缺省不给 --session 且环境变量里没有会话 id → 退出 1（绝不回退 latest，即使磁盘上有会话）', () => {
+  const root = freshRoot()
+  const cwd = '/tmp/proj-env-missing'
+  // 磁盘上有一条「全盘最新」的违规会话：老版会默默检查它并 exit 2/0。新版必须直接报错。
+  createSession({ root, cwd, uuid: 'e0e0e0e0-0000-4000-8000-0000000000e0', events: tenEditsOverSevenFiles() })
+
+  const res = runWithEnv([], { root, env: { DSH_SESSION_ID: '' } })
+  assert.equal(res.status, 1, `取不到会话 id 必须 exit 1，实际 ${res.status}：${res.stdout}`)
+  assert.equal(res.stdout, '', '错误时 stdout 为空（脚本不该读到半截报告）')
+  assert.match(res.stderr, /取不到当前会话 id/)
+  assert.match(res.stderr, /DSH_SESSION_ID/, '要说出缺的是哪个环境变量')
+  assert.match(res.stderr, /--session/, '要给出可操作下一步')
+  assert.doesNotMatch(res.stderr, /^\s+at /m, '不把栈丢给用户')
+})
+
+test('🦷 A-红牙：环境变量里的会话 id 指向 A，磁盘上 B 更新 → 必须检查 A（不再按 mtime 猜）', () => {
+  const root = freshRoot()
+  const cwd = '/tmp/proj-env-authoritative'
+  const a = createSession({ root, cwd, uuid: 'a1a1a1a1-00aa-4aaa-8aaa-0000000000a1', events: [edit('/p/a.ts')] })
+  const b = createSession({ root, cwd, uuid: 'b2b2b2b2-00bb-4bbb-8bbb-0000000000b2', events: tenEditsOverSevenFiles() })
+
+  // 让 B 明确更新：若实现还按 mtime 猜，就会检查 B（exit 2）。
+  const oldTime = new Date(Date.now() - 3600_000)
+  fs.utimesSync(path.join(a.dir, 'session.jsonl'), oldTime, oldTime)
+
+  const res = runWithEnv(['--json'], { root, env: { DSH_SESSION_ID: 'a1a1a1a1-00aa-4aaa-8aaa-0000000000a1' } })
+  assert.equal(res.status, 0, `必须检查 A（PASS），实际 ${res.status}：${res.stderr}`)
+  const report = JSON.parse(res.stdout)
+  assert.equal(report.session.dir, a.dir, '命中的必须是环境变量指定的 A，不是 mtime 更新的 B')
+  assert.notEqual(report.session.dir, b.dir)
+  assert.equal(report.session.selectorSource, 'env')
+  assert.equal(report.session.selectedBy, 'env')
+})
+
+test('A-绿牙：`--session current` 与缺省同义，显式写出来也读环境变量', () => {
+  const root = freshRoot()
+  const cwd = '/tmp/proj-env-current'
+  const { dir } = createSession({ root, cwd, uuid: 'c3c3c3c3-00cc-4ccc-8ccc-0000000000c3', events: [edit('/p/a.ts')] })
+
+  const res = runWithEnv(['--session', 'current', '--json'], { root, env: { DSH_SESSION_ID: 'c3c3c3c3-00cc-4ccc-8ccc-0000000000c3' } })
+  assert.equal(res.status, 0, res.stderr)
+  const report = JSON.parse(res.stdout)
+  assert.equal(report.session.dir, dir)
+  assert.equal(report.session.selectorSource, 'env')
+
+  const human = runWithEnv(['--session', 'current'], { root, env: { DSH_SESSION_ID: 'c3c3c3c3-00cc-4ccc-8ccc-0000000000c3' } })
+  assert.match(human.stdout, /选会话\s+按环境变量里的会话 id/, '人类输出要说清这次会话是怎么选出来的')
+})
+
+test('A：`--session-env` 换变量名；名对了取值、名指错则报错并点名那个变量', () => {
+  const root = freshRoot()
+  const cwd = '/tmp/proj-env-rename'
+  const { dir } = createSession({ root, cwd, uuid: 'd4d4d4d4-00dd-4ddd-8ddd-0000000000d4', events: [edit('/p/a.ts')] })
+
+  const ok = runWithEnv(['--session-env', 'MY_SESSION', '--json'], { root, env: { MY_SESSION: 'd4d4d4d4-00dd-4ddd-8ddd-0000000000d4', DSH_SESSION_ID: 'wrong-id' } })
+  assert.equal(ok.status, 0, `--session-env 指定的变量里有值就该用：${ok.stderr}`)
+  assert.equal(JSON.parse(ok.stdout).session.dir, dir, '显式 --session-env 要盖过缺省的 DSH_SESSION_ID')
+
+  const bad = runWithEnv(['--session-env', 'NOT_SET_ANYWHERE'], { root })
+  assert.equal(bad.status, 1)
+  assert.match(bad.stderr, /NOT_SET_ANYWHERE/, '报错要点名用户指定的变量名，方便一眼看出拼错')
+})
+
+test('🦷 A-红牙：环境变量值是 latest → 退出 1（否则又掉回「猜会话」）', () => {
+  const root = freshRoot()
+  createSession({ root, cwd: '/tmp/proj-env-latest', uuid: 'e5e5e5e5-00ee-4eee-8eee-0000000000e5', events: [edit('/p/a.ts')] })
+
+  const res = runWithEnv([], { root, env: { DSH_SESSION_ID: 'latest' } })
+  assert.equal(res.status, 1, `环境变量给 latest 必须拒绝：${res.stdout}`)
+  assert.match(res.stderr, /latest/)
+  assert.match(res.stderr, /不是会话 id/)
+})
+
+test('🦷 A-红牙：`--session latest` 默认退出 1，并说明它钉错过会话', () => {
+  const root = freshRoot()
+  createSession({ root, cwd: '/tmp/proj-latest-refused', uuid: 'f6f6f6f6-00ff-4fff-8fff-0000000000f6', events: tenEditsOverSevenFiles() })
+
+  const res = run(['--session', 'latest'], { root })
+  assert.equal(res.status, 1, `latest 缺省必须拒绝，实际 ${res.status}`)
+  assert.match(res.stderr, /钉错过会话/)
+  assert.match(res.stderr, /--allow-latest/, '要告诉用户逃生口怎么开')
+  assert.match(res.stderr, /--session current/, '要给出推荐做法')
+})
+
+test('A：`--session latest --allow-latest` 才按老行为跑，且 stderr + 报告里都有警告', () => {
+  const root = freshRoot()
+  createSession({ root, cwd: '/tmp/proj-latest-allowed', uuid: '01010101-00f0-4f0f-8f0f-000000000101', events: tenEditsOverSevenFiles() })
+
+  const res = run(['--session', 'latest', '--allow-latest', '--json'], { root })
+  assert.equal(res.status, 2, `--allow-latest 之后应恢复老行为（判违规）：${res.stderr}`)
+  assert.match(res.stderr, /警告/, '逃生口必须打警告到 stderr，不能只在 JSON 里')
+  assert.match(res.stderr, /猜会话/)
+  const report = JSON.parse(res.stdout)
+  assert.equal(report.session.selectorSource, 'latest-allowed')
+  assert.match(report.warnings.join('\n'), /--allow-latest/, '报告里也要留同一条警告')
+})
+
+test('A：显式目录 / uuid 前缀的语义不变（不读环境变量）', () => {
+  const root = freshRoot()
+  const cwd = '/tmp/proj-explicit-unchanged'
+  const { dir } = createSession({ root, cwd, uuid: 'abababab-00ab-4bab-8bab-00000000abab', events: [edit('/p/a.ts')] })
+
+  const byDir = runWithEnv(['--session', dir, '--json'], { root, env: { DSH_SESSION_ID: 'unrelated' } })
+  assert.equal(byDir.status, 0, byDir.stderr)
+  assert.equal(JSON.parse(byDir.stdout).session.dir, dir)
+  assert.equal(JSON.parse(byDir.stdout).session.selectorSource, 'explicit')
+
+  const byPrefix = runWithEnv(['--session', 'abababab', '--json'], { root, env: { DSH_SESSION_ID: 'unrelated' } })
+  assert.equal(byPrefix.status, 0, byPrefix.stderr)
+  assert.equal(JSON.parse(byPrefix.stdout).session.resolvedBy, 'prefix')
+})
+
+// ============================================================================
+// B. bash 写入识别
+//
+// 失效背景（真机实测）：60 份日志里 bash 1788 次、edit 只有 252 次 —— 老版 EDIT_TOOLS 只有
+// edit/write，用 bash 写文件的改动**完全不计**，于是「主会话用 bash 改了 7 个文件」被判 PASS。
+// ============================================================================
+
+/** 一次 bash 调用；`arguments` 是 JSON 字符串（与真实日志一致）。 */
+function bashCall(command) {
+  return toolCall('bash', JSON.stringify({ command, description: 'x' }))
+}
+
+test('🦷 B-红牙：主会话 1 次 edit + 2 次 bash 重定向写文件 → 计入 files 并判 VIOLATION', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: '1b1b1b1b-1b1b-4b1b-8b1b-000000001b1b',
+    events: [
+      edit('/p/src/a.ts'),
+      bashCall('printf x > /p/src/b.ts'),
+      bashCall('printf y >> /p/src/c.ts'),
+    ],
+  })
+
+  const res = run(['--session', dir, '--json'], { root })
+  assert.equal(res.status, 2, `bash 写的两个文件必须计入改动文件集合，实际 ${res.status}：${res.stderr}`)
+
+  const report = JSON.parse(res.stdout)
+  assert.equal(report.bashEdits.count, 2)
+  assert.equal(report.bashEdits.parent, 2)
+  assert.equal(report.bashEdits.confidence, 'low', 'bash 解析出的改动只能是低置信证据')
+  assert.equal(report.fileCount, 3, 'edit 的 1 个 + bash 的 2 个 = 3（§D 要求 bash 计入 fileCount）')
+  assert.deepEqual(report.bashFiles.sort(), ['/p/src/b.ts', '/p/src/c.ts'])
+  assert.equal(report.verdict, 'VIOLATION')
+})
+
+test('B：六类写操作都能识别（redirect / tee / sed -i / perl -i / git apply / patch -p）', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: '2c2c2c2c-2c2c-4c2c-8c2c-000000002c2c',
+    events: [
+      bashCall('echo hi > /p/s1.ts'),
+      bashCall('echo hi | tee /p/s2.ts'),
+      bashCall('sed -i "" "s/a/b/" /p/s3.ts'),
+      bashCall('perl -pi -e "s/a/b/" /p/s4.ts'),
+      bashCall('git apply /p/fix.patch'),
+      bashCall('patch -p1 < /p/change.diff'),
+    ],
+  })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  const kinds = new Set(report.bashEdits.writes.map((write) => write.kind))
+  for (const kind of ['redirect', 'tee', 'sed-in-place', 'perl-in-place', 'git-apply', 'patch']) {
+    assert.equal(kinds.has(kind), true, `应识别 ${kind}，实际识别到：${[...kinds].join(', ')}`)
+  }
+  assert.equal(report.bashEdits.count, 6)
+
+  // patch 的输入重定向 `< /p/change.diff` 是**读**，但 `patch -p1` 本身是写；目标取最后一个 token。
+  const patchWrite = report.bashEdits.writes.find((write) => write.kind === 'patch')
+  assert.ok(patchWrite, '要留下 patch 的写操作记录')
+})
+
+test('B-绿牙：非写命令、`2>&1`、`>/dev/null`、引号里的 `>` 都不计 bashEdits', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: '3d3d3d3d-3d3d-4d3d-8d3d-000000003d3d',
+    events: [
+      bashCall('ls -la src/'),
+      bashCall('cat package.json'),
+      bashCall('npm test 2>&1'),
+      bashCall('node build.mjs > /dev/null'),
+      bashCall('echo "a > b"'),
+      bashCall('grep -rn "x > y" src/'),
+    ],
+  })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  assert.equal(report.bashEdits.count, 0, `这些都不是写仓库文件：${JSON.stringify(report.bashEdits.writes)}`)
+  assert.equal(report.bashEdits.scratchExcluded, 0)
+  assert.equal(report.fileCount, 0)
+  assert.equal(report.verdict, 'PASS')
+})
+
+test('B：临时目录/日志的写入不计入 files，但要显式说明「排除了什么」（不静默丢）', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: '4e4e4e4e-4e4e-4e4e-8e4e-000000004e4e',
+    events: [edit('/p/src/a.ts'), bashCall('npm test > /tmp/test-out.log 2>&1')],
+  })
+
+  const res = run(['--session', dir, '--json'], { root })
+  assert.equal(res.status, 0, `读操作的日志重定向不该被当成改了两个文件：${res.status}：${res.stderr}`)
+
+  const report = JSON.parse(res.stdout)
+  assert.equal(report.bashEdits.count, 1, '仍然要说「有 1 处 bash 写操作」')
+  assert.equal(report.bashEdits.scratchExcluded, 1)
+  assert.equal(report.fileCount, 1, '临时目录里的目标不算仓库改动')
+  assert.match(report.warnings.join('\n'), /临时目录\/日志/, '排除了什么必须写清楚')
+  assert.match(report.warnings.join('\n'), /\/tmp\/test-out\.log/)
+})
+
+test('B：bash 写操作识别不出路径时计 unparsed 并留 warning（宁可少算，不可静默）', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: '5f5f5f5f-5f5f-4f5f-8f5f-000000005f5f',
+    events: [edit('/p/src/a.ts'), bashCall('echo x >')],
+  })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  assert.equal(report.bashEdits.count, 0, '没目标就不能编一个路径出来')
+  assert.match(report.warnings.join('\n'), /识别不出目标路径/)
+})
+
+test('B：坏 arguments 的 bash 调用不崩，并留一条「其中写操作未计入」的 warning', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: '6a6a6a6a-6a6a-4a6a-8a6a-000000006a6a',
+    events: [
+      toolCall('bash', '{不是 JSON'),
+      toolCall('bash', ''),
+      toolCall('bash', JSON.stringify({ description: 'no-command' })),
+      edit('/p/src/a.ts'),
+    ],
+  })
+
+  const res = run(['--session', dir, '--json'], { root })
+  assert.equal(res.status, 0, `坏 bash 参数不等于违规，更不等于崩溃：${res.stderr}`)
+  const report = JSON.parse(res.stdout)
+  assert.equal(report.bashEdits.count, 0)
+  const bashWarnings = report.warnings.filter((warning) => warning.includes('bash'))
+  assert.equal(bashWarnings.length >= 3, true, `3 条坏 bash 调用各应留痕，实际 ${bashWarnings.length}`)
+})
+
+test('🦷 B-红牙（§D 边界）：只用 bash 写、一次 edit 都没有 → 仍 PASS（不破坏 parentEdits===0 短路）', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: '7b7b7b7b-7b7b-4b7b-8b7b-000000007b7b',
+    events: [bashCall('echo a > /p/s1.ts'), bashCall('echo b > /p/s2.ts'), bashCall('echo c > /p/s3.ts')],
+  })
+
+  const res = run(['--session', dir, '--json'], { root })
+  assert.equal(res.status, 0, `parentEdits===0 的短路必须保留：${res.stderr}`)
+
+  const report = JSON.parse(res.stdout)
+  assert.equal(report.parentEdits, 0, 'parentEdits 只数 edit/write，不被 bash 灌水')
+  assert.equal(report.bashEdits.count, 3)
+  assert.equal(report.fileCount, 3, 'bash 目标仍进 files（可见），只是不参与这条短路之后的判定')
+  assert.equal(report.verdict, 'PASS')
+  assert.match(report.warnings.join('\n'), /bash 写操作/)
+})
+
+test('B：子会话里的 bash 写入计入 bashEdits.child（归因用）', () => {
+  const root = freshRoot()
+  const cwd = '/tmp/proj-child-bash'
+  const childId = '88888888-aaaa-4aaa-8aaa-00000000aaaa'
+
+  const { dir } = createSession({
+    root,
+    cwd,
+    uuid: '9c9c9c9c-9c9c-4c9c-8c9c-000000009c9c',
+    events: [edit('/p/src/a.ts'), dispatchEvent('subagent'), catalog(childId, 'agent-1')],
+  })
+  createSession({ root, cwd, uuid: childId, dirName: childId, events: [bashCall('sed -i "" "s/x/y/" /p/src/z.ts')] })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  assert.equal(report.bashEdits.child, 1, '子会话的 bash 写操作要单独计数')
+  assert.equal(report.bashEdits.parent, 0)
+  assert.equal(report.verdict, 'PASS', '派过实现队友 → PASS')
+})
+
+// ============================================================================
+// C. 人格校验进 verdict（默认只 warning）+ D. 严格归因
+// ============================================================================
+
+test('🦷 C-红牙：`--persona-verdict` 时才把「队友缺人格」判成 VIOLATION', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'adadadad-adad-4dad-8dad-00000000adad',
+    events: [
+      ...tenEditsOverSevenFiles(),
+      subagentCall('frontend-developer', PLAIN_PROMPT),
+    ],
+  })
+
+  const relaxed = run(['--session', dir, '--json'], { root })
+  assert.equal(relaxed.status, 0, `默认只 warning，不改变 verdict：${relaxed.stderr}`)
+  assert.equal(JSON.parse(relaxed.stdout).dispatch.persona.missing, 1)
+
+  const strict = run(['--session', dir, '--persona-verdict', '--json'], { root })
+  assert.equal(strict.status, 2, `--persona-verdict 打开后必须判违规：${strict.stderr}`)
+  const report = JSON.parse(strict.stdout)
+  assert.equal(report.verdict, 'VIOLATION')
+  assert.match(report.summary, /没有专家人格/)
+  assert.match(report.summary, /--persona-verdict/)
+})
+
+test('C-绿牙：`--persona-verdict` + 人格贴全 → PASS', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'bebebebe-bebe-4ebe-8ebe-00000000bebe',
+    events: [...tenEditsOverSevenFiles(), subagentCall('code-reviewer', PERSONA_PROMPT)],
+  })
+
+  const res = run(['--session', dir, '--persona-verdict', '--json'], { root })
+  assert.equal(res.status, 0, `贴全人格就不该判违规：${res.stderr}`)
+  const report = JSON.parse(res.stdout)
+  assert.equal(report.dispatch.persona.checked, 1)
+  assert.equal(report.dispatch.persona.missing, 0)
+})
+
+test('C-绿牙：人格清单扫不到时降级 warning、不崩；`--persona-verdict` 也不会凭「没法判」判违规', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'cfcfcfcf-cfcf-4fcf-8fcf-00000000cfcf',
+    events: [...tenEditsOverSevenFiles(), subagentCall('code-reviewer', PERSONA_PROMPT)],
+  })
+
+  const res = parseJsonOutput(
+    run(['--session', dir, '--persona-root', path.join(root, 'no-such-personas'), '--persona-verdict', '--json'], { root }),
+  )
+  assert.equal(res.verdict, 'PASS', '没清单 ≠ 没人格，不能凭此判违规')
+  assert.equal(res.dispatch.persona.checked, 0, '判不了就不许计入 checked')
+  assert.match(res.warnings.join('\n'), /人格检查未执行/)
+  assert.match(res.warnings.join('\n'), /人格根目录不存在|没有可用的人格根目录/)
+})
+
+test('🦷 D-红牙：`--strict-attribution` 下「主会话跨多文件改 >=2 次、子会话改动 0」→ VIOLATION', () => {
+  const root = freshRoot()
+  const cwd = '/tmp/proj-strict'
+  const missingChild = 'dededede-dede-4ede-8ede-00000000dede'
+  const { dir } = createSession({
+    root,
+    cwd,
+    uuid: 'efefefef-efef-4fef-8fef-00000000efef',
+    events: [...tenEditsOverSevenFiles(), dispatchEvent('subagent'), catalog(missingChild, 'agent-1')],
+  })
+
+  const relaxed = run(['--session', dir, '--json'], { root })
+  assert.equal(relaxed.status, 0, `默认不按严格归因判：${relaxed.stderr}`)
+  assert.match(
+    JSON.parse(relaxed.stdout).warnings.join('\n'),
+    /严格归因未开启（--strict-attribution）/,
+    '默认虽不判，但必须提示「本来可以判」，否则开关等于没人知道',
+  )
+
+  const strict = run(['--session', dir, '--strict-attribution', '--json'], { root })
+  assert.equal(strict.status, 2, `严格归因打开后必须判违规：${strict.stderr}`)
+  const report = JSON.parse(strict.stdout)
+  assert.equal(report.verdict, 'VIOLATION')
+  assert.match(report.summary, /--strict-attribution/)
+  assert.match(report.warnings.join('\n'), /子会话日志不可读/, '日志不可读的 caveat 必须写出来')
+})
+
+test('D-绿牙：`--strict-attribution` + 子会话真有改动 → PASS', () => {
+  const root = freshRoot()
+  const cwd = '/tmp/proj-strict-ok'
+  const childId = 'f1f1f1f1-f1f1-4f1f-8f1f-00000000f1f1'
+
+  const { dir } = createSession({
+    root,
+    cwd,
+    uuid: 'f2f2f2f2-f2f2-4f2f-8f2f-00000000f2f2',
+    events: [...tenEditsOverSevenFiles(), dispatchEvent('subagent'), catalog(childId, 'agent-1')],
+  })
+  createSession({ root, cwd, uuid: childId, events: [edit('/p/src/c.ts'), edit('/p/src/d.ts')] })
+
+  const res = run(['--session', dir, '--strict-attribution', '--json'], { root })
+  assert.equal(res.status, 0, `子会话确有改动就不该判违规：${res.stderr}`)
+  assert.equal(JSON.parse(res.stdout).childEdits, 2)
+})
+
+test('D-绿牙：`--strict-attribution` + 主会话只改 1 次（parentEdits<2）→ 不触发', () => {
+  const root = freshRoot()
+  const cwd = '/tmp/proj-strict-single'
+  const { dir } = createSession({
+    root,
+    cwd,
+    uuid: 'f3f3f3f3-f3f3-4f3f-8f3f-00000000f3f3',
+    events: [edit('/p/src/a.ts'), dispatchEvent('subagent'), catalog('f4f4f4f4-f4f4-4f4f-8f4f-00000000f4f4', 'agent-1')],
+  })
+
+  const res = run(['--session', dir, '--strict-attribution', '--json'], { root })
+  assert.equal(res.status, 0, `parentEdits<2 不满足严格归因条件：${res.stderr}`)
+})
+
+test('人类输出：bashEdits 单独一行并标 confidence low，明细只列被计入的写操作', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'f5f5f5f5-f5f5-4f5f-8f5f-00000000f5f5',
+    events: [edit('/p/src/a.ts'), bashCall('echo x > /p/src/b.ts'), bashCall('echo y > /tmp/scratch.log')],
+  })
+
+  const human = run(['--session', dir], { root })
+  assert.match(human.stdout, /bashEdits\s+2（confidence: low；主 2 \/ 子 0；临时目录已排除 1）/)
+  assert.match(human.stdout, /bash 写文件（confidence: low，从命令串解析）\n\s+- \[redirect\] \/p\/src\/b\.ts（主会话）/)
+  assert.doesNotMatch(human.stdout, /\[redirect\] \/tmp\/scratch\.log/, '被排除的目标不列进改动明细')
+})
+
+test('--help 写明新增参数（逃生口与开关都要能被发现）', () => {
+  const res = run(['--help'], {})
+  assert.equal(res.status, 0)
+  for (const flag of ['--session current', '--session-env', '--allow-latest', '--persona-root', '--persona-verdict', '--strict-attribution']) {
+    assert.equal(res.stdout.includes(flag), true, `用法里必须写 ${flag}`)
+  }
+  assert.match(res.stdout, /DSH_SESSION_ID/, '要说明缺省从哪个环境变量取会话 id')
+})
+
+// ============================================================================
+// B'. bash 目标路径的形状过滤（真机跑出来的假阳性）
+//
+// 首次真机跑这份实现时，报告里冒出 `=30`、`0)`、`是**读**操作` 这类"改动文件" ——
+// 全是从 `>= 30`、引号里的 `a > b`、注释里的箭头解析出来的垃圾。垃圾路径比不检测更糟：
+// 读者会认为工具在瞎报，然后连真发现一起不信。下面钉住「什么不该被当成写文件」。
+// ============================================================================
+
+test('🦷 B\'-红牙：`>=` 比较运算符、`2>&1`、引号里的 `>` 都不产生垃圾路径', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'aa11bb22-aa11-4a11-8a11-00000000aa11',
+    events: [
+      bashCall('node -e "if (n >= 30) console.log(1)"'),
+      bashCall('test 5 -ge 3 && echo ok 2>&1'),
+      bashCall('echo "a > b" && echo done'),
+      bashCall('awk \'{ if ($1 >= 2) print }\' data.txt'),
+      // 算术比较 / 括号残留 / CJK 说明文字：目标 token 不像路径，必须过滤掉
+      bashCall('echo $((count > limit))'),
+      bashCall('echo x > result))'),
+      bashCall('echo ok > 说明'),
+      edit('/p/src/a.ts'),
+    ],
+  })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  assert.equal(report.bashEdits.count, 0, `这些都不是写文件，实际解析出：${JSON.stringify(report.bashEdits.writes)}`)
+  assert.equal(report.fileCount, 1, '只应有 edit 的那一个文件')
+  assert.equal(report.verdict, 'PASS', '不该被垃圾路径推到「跨多文件」')
+})
+
+test('B\'：路径形状过滤不会误删真目标（绝对路径 / 相对路径 / 带扩展名 / tee 裸名）', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'bb22cc33-bb22-4b22-8b22-00000000bb22',
+    events: [
+      bashCall('echo x > /abs/path/file.ts'),
+      bashCall('echo x > ./rel/file.js'),
+      bashCall('echo x >> notes.md'),
+      bashCall('echo x | tee build-log'),
+    ],
+  })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  const paths = report.bashEdits.writes.map((write) => write.path).sort()
+  // 默认字符串排序：'.' (46) < '/' (47)，所以 './rel/...' 在 '/abs/...' 之前
+  assert.deepEqual(paths, ['./rel/file.js', '/abs/path/file.ts', 'build-log', 'notes.md'])
+})
+
+// ============================================================================
+// A'. 会话目录布局：裸 uuid 与 session- 前缀都要认
+//
+// 真机事实（本机 sessions 根）：`session-*` 101 个、裸 `<uuid>` 285 个，且**正在写的会话**
+// 就是裸 uuid。老实现只匹配 `session-` 前缀，于是 `--session <当前会话 uuid>` 永远找不到 ——
+// 「按会话 id 定位」在新布局下等于没实现。没有这条用例，A 项会变成"看起来修了"。
+// ============================================================================
+
+test('🦷 A\'-红牙：裸 uuid 布局的会话目录能被 --session <uuid> 与环境变量解析到', () => {
+  const root = freshRoot()
+  const cwd = '/tmp/proj-bare-uuid'
+  const uuid = 'cc33dd44-cc33-4c33-8c33-00000000cc33'
+  // 裸 uuid 目录（新布局）：不写 session- 前缀
+  const { dir } = createSession({ root, cwd, uuid, dirName: uuid, events: tenEditsOverSevenFiles() })
+
+  const byPrefix = runWithEnv(['--session', uuid.slice(0, 8), '--json'], { root })
+  assert.equal(byPrefix.status, 2, `裸 uuid 目录必须能被 uuid 前缀解析到：${byPrefix.stderr}`)
+  assert.equal(JSON.parse(byPrefix.stdout).session.dir, dir)
+
+  const byFull = runWithEnv(['--session', `session-${uuid}`, '--json'], { root })
+  assert.equal(byFull.status, 2, '带 session- 前缀的写法指向同一会话（两种布局互通）')
+  assert.equal(JSON.parse(byFull.stdout).session.dir, dir)
+
+  const byEnv = runWithEnv(['--json'], { root, env: { DSH_SESSION_ID: uuid } })
+  assert.equal(byEnv.status, 2, `环境变量给的会话 id 必须解析到裸 uuid 目录：${byEnv.stderr}`)
+  assert.equal(JSON.parse(byEnv.stdout).session.dir, dir)
+})
+
+test('A\'：目录名不像会话 id 且没有日志的兄弟目录不会被当成会话（不污染 latest 候选）', () => {
+  const root = freshRoot()
+  const cwd = '/tmp/proj-layout-noise'
+  const { dir } = createSession({ root, cwd, uuid: 'dd44ee55-dd44-4d44-8d44-00000000dd44', events: [edit('/p/a.ts')] })
+  // 同 workspace 下放一个普通目录（无日志、名字也不是 uuid）
+  fs.mkdirSync(path.join(path.dirname(dir), 'scratch-notes'), { recursive: true })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  assert.equal(report.children.length, 0)
+  assert.equal(report.session.dir, dir)
+})
+
+test('A：只给 --cwd 而取不到会话 id → 退出 1，且提示里给出「--cwd 要配 --session」的具体组合', () => {
+  const root = freshRoot()
+  const cwd = makeCwdDir('only-cwd')
+  createSession({ root, cwd, uuid: 'ee55ff66-ee55-4e55-8e55-00000000ee55', events: [edit('/p/a.ts')] })
+
+  const res = runWithEnv(['--cwd', cwd], { root })
+  assert.equal(res.status, 1, '不再有「只给 --cwd 就猜 latest」的隐式行为')
+  assert.match(res.stderr, /取不到当前会话 id/)
+  assert.match(res.stderr, /--session latest --allow-latest --cwd/, '要给出可直接照抄的参数组合')
+})
+
+test('🦷 B\'-红牙：引号里的 `|` 是 sed 分隔符，不能被当成管道（否则会解析出「改文件 s」）', () => {
+  const root = freshRoot()
+  const { dir } = createSession({
+    root,
+    uuid: 'ff66aa77-ff66-4f66-8f66-00000000ff66',
+    events: [
+      bashCall('sed -i "s|a|b|" f.ts'),
+      bashCall("sed -i 's/x|y/z/' src/x.ts"),
+      bashCall('cat data.txt | tee build-log'),
+    ],
+  })
+
+  const report = parseJsonOutput(run(['--session', dir, '--json'], { root }))
+  const paths = report.bashEdits.writes.map((write) => write.path).sort()
+  assert.deepEqual(paths, ['build-log', 'f.ts', 'src/x.ts'], `引号内的分隔符必须被跳过，实际：${JSON.stringify(paths)}`)
+  assert.equal(
+    report.bashEdits.writes.some((write) => write.path === 's' || write.path === 'a' || write.path === 'b'),
+    false,
+    'sed 表达式不能被当成目标路径',
+  )
+  // 管道右侧的 tee 仍然要认（引号安全切分不能把正常管道也一起废掉）
+  assert.equal(report.bashEdits.writes.find((write) => write.kind === 'tee').path, 'build-log')
 })

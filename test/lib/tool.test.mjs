@@ -111,8 +111,8 @@ test('buildToolSpec: name / description / parameters / execute 齐全，必填�
 
   assert.deepEqual(
     Object.keys(spec.parameters).sort(),
-    ['expert', 'scopes', 'task', 'task_id', 'verify', 'worker'],
-    'parameters 必须是这 6 个键，缺一或多一都算接口漂移',
+    ['expert', 'kind', 'scopes', 'surface', 'task', 'task_id', 'verify', 'worker'],
+    'parameters 必须是这 8 个键，缺一或多一都算接口漂移',
   )
 
   for (const param of ['expert', 'task', 'verify']) {
@@ -129,6 +129,20 @@ test('buildToolSpec: name / description / parameters / execute 齐全，必填�
   assert.notEqual(spec.parameters.task_id.required, true, 'task_id 是可选项')
   assert.equal(spec.parameters.worker.type, 'string')
   assert.notEqual(spec.parameters.worker.required, true, 'worker 是可选项')
+
+  // surface / kind：可选、枚举、description 必须写明缺省值（否则调用方不知道不传会发生什么）
+  assert.equal(spec.parameters.surface.type, 'string')
+  assert.notEqual(spec.parameters.surface.required, true, 'surface 是可选项')
+  assert.deepEqual(spec.parameters.surface.enum, ['agent-teams', 'official', 'none'])
+  assert.match(spec.parameters.surface.description, /默认 none/, 'surface 的 description 要写清默认 none')
+  assert.equal(spec.parameters.kind.type, 'string')
+  assert.notEqual(spec.parameters.kind.required, true, 'kind 是可选项')
+  assert.deepEqual(spec.parameters.kind.enum, ['implementation', 'review', 'work'])
+  assert.match(
+    spec.parameters.kind.description,
+    /默认 "implementation"/,
+    'kind 的 description 要写清默认 implementation',
+  )
 })
 
 test('buildToolSpec: 多次调用 name 相同（幂等），且不共享可变状态', () => {
@@ -902,4 +916,146 @@ test('CLI: 重复 --scope 逐条进入写作用域', () => {
   assert.equal(status, 0)
   assert.ok(stdout.includes('- dsh-expert-team-kit/lib/tool.mjs'))
   assert.ok(stdout.includes('- dsh-expert-team-kit/test/tool.test.mjs'))
+})
+
+// ——————————— T2-E：surface / kind 透传（含三类 surface 的收尾协议）———————————
+
+/**
+ * 从任务书顶部抠出任务字段 JSON 并解析（定位方式不写死围栏长度）。
+ * @param {string} text
+ * @returns {Record<string, unknown>}
+ */
+function parseTopFieldSpec(text) {
+  const banner = '以下 JSON 必须原样写进任务字段，否则门禁不生效'
+  const at = text.indexOf(banner)
+  assert.notEqual(at, -1, '任务书顶部必须有任务字段 JSON 的固定提示语')
+
+  const rest = text.slice(at)
+  const open = /^(`{3,})json$/m.exec(rest)
+  assert.ok(open, '提示语之后必须紧跟 ```json 代码块')
+  const openLineEnd = rest.indexOf(open[0]) + open[0].length
+  const closeAt = rest.indexOf(`\n${open[1]}`, openLineEnd)
+  assert.notEqual(closeAt, -1, 'JSON 代码块必须闭合')
+  return JSON.parse(rest.slice(openLineEnd, closeAt).trim())
+}
+
+test('E: surface / kind 作为可选参数透传到任务字段 JSON', () => {
+  for (const surface of ['none', 'official', 'agent-teams']) {
+    for (const kind of ['implementation', 'review', 'work']) {
+      const text = executeExpertBrief(makeArgs({ surface, kind })).content[0].text
+      const fieldSpec = parseTopFieldSpec(text)
+
+      assert.equal(fieldSpec.surface, surface, `surface=${surface} 必须原样进任务字段`)
+      assert.equal(fieldSpec.kind, kind, `kind=${kind} 必须原样进任务字段`)
+    }
+  }
+})
+
+test('E: 不传 surface 时任务书不出现 team_task_get（默认 none，向后兼容）', () => {
+  const text = executeExpertBrief(makeArgs()).content[0].text
+
+  assert.equal(parseTopFieldSpec(text).surface, 'none', 'surface 缺省必须是 none')
+  assert.equal(parseTopFieldSpec(text).kind, 'implementation', 'kind 缺省必须是 implementation')
+  assert.ok(!text.includes('team_task_get'), '默认不该让队友去调本机不存在的 team_task_get')
+  assert.ok(!text.includes('team_task_update'), '默认不该出现 team_task_update')
+  assert.ok(!text.includes('agent_teams_claim_task({'), '默认不该出现 agent_teams_claim_task 调用')
+  assert.match(text.slice(text.indexOf('## 5. 工作流程')), /第 6 节/, '必须给出收尾指引')
+})
+
+test('E: surface=official / agent-teams 各自生成对应协议（互不混入）', () => {
+  const official = executeExpertBrief(makeArgs({ surface: 'official' })).content[0].text
+  assert.match(official, /team_task_get\(\{task_id:"task-8"\}\)/)
+  assert.ok(!official.includes('agent_teams_claim_task('), 'official 不该出现 agent-teams 调用')
+
+  const agentTeams = executeExpertBrief(makeArgs({ surface: 'agent-teams' })).content[0].text
+  assert.match(agentTeams, /agent_teams_claim_task\(\{task_id:"task-8", assignee:"worker-tool"\}\)/)
+  assert.match(agentTeams, /agent_teams_complete_task\(\{task_id:"task-8", attempt_id:/)
+  assert.ok(!agentTeams.includes('team_task_get'), 'agent-teams 不该出现 team_task_get')
+})
+
+test('E: surface / kind 非法值抛 INVALID_PARAM 并点名参数（不静默退回缺省）', () => {
+  for (const badSurface of ['agent_teams', 'Agent-Teams', 'team', '']) {
+    if (badSurface === '') continue // 空串 = 没填，属合法
+    assertToolError(
+      () => executeExpertBrief(makeArgs({ surface: badSurface })),
+      'surface',
+      /agent-teams/,
+    )
+  }
+
+  for (const badKind of ['impl', 'Implementation', 'coding']) {
+    assertToolError(() => executeExpertBrief(makeArgs({ kind: badKind })), 'kind', /implementation/)
+  }
+
+  // 非字符串同样拒绝（静默忽略会让调用方以为传进去了）
+  assertToolError(() => executeExpertBrief(makeArgs({ surface: 1 })), 'surface')
+  assertToolError(() => executeExpertBrief(makeArgs({ kind: true })), 'kind')
+})
+
+test('E: surface / kind 传空串或空白视同「未提供」，走缺省值', () => {
+  for (const blank of ['', '   ', null, undefined]) {
+    const text = executeExpertBrief(makeArgs({ surface: blank, kind: blank })).content[0].text
+    const fieldSpec = parseTopFieldSpec(text)
+
+    assert.equal(fieldSpec.surface, 'none', `surface=${JSON.stringify(blank)} 应缺省成 none`)
+    assert.equal(fieldSpec.kind, 'implementation', `kind=${JSON.stringify(blank)} 应缺省成 implementation`)
+  }
+})
+
+test('CLI: --surface / --kind 生效（含 --surface=official 的等号写法）', () => {
+  const spaced = runCli([
+    '--expert',
+    'code-reviewer',
+    '--task',
+    TASK,
+    '--verify',
+    VERIFY,
+    '--surface',
+    'agent-teams',
+    '--kind',
+    'review',
+  ])
+  assert.equal(spaced.status, 0, `CLI 应成功，stderr=${spaced.stderr}`)
+  const spacedSpec = parseTopFieldSpec(spaced.stdout)
+  assert.equal(spacedSpec.surface, 'agent-teams')
+  assert.equal(spacedSpec.kind, 'review')
+  assert.match(spaced.stdout, /agent_teams_claim_task\(\{task_id:"（未指定 task id）", assignee:"worker"\}\)/)
+
+  const inline = runCli([
+    '--expert',
+    'code-reviewer',
+    '--task',
+    TASK,
+    '--verify',
+    VERIFY,
+    '--surface=official',
+  ])
+  assert.equal(inline.status, 0, `--surface=official 应成功，stderr=${inline.stderr}`)
+  assert.equal(parseTopFieldSpec(inline.stdout).surface, 'official')
+})
+
+test('CLI: --surface 非法值退出码 1，stderr 点名 surface 并列出允许值', () => {
+  const { status, stdout, stderr } = runCli([
+    '--expert',
+    'code-reviewer',
+    '--task',
+    TASK,
+    '--verify',
+    VERIFY,
+    '--surface',
+    'agent_teams',
+  ])
+
+  assert.equal(status, 1, '非法 surface 必须失败，不能静默退回 none')
+  assert.equal(stdout, '', '失败时 stdout 必须为空')
+  assert.match(stderr, /surface/)
+  assert.match(stderr, /agent-teams/, '要列出允许值')
+})
+
+test('CLI: --help 列出 --surface 与 --kind', () => {
+  const { status, stdout } = runCli(['--help'])
+  assert.equal(status, 0)
+  assert.match(stdout, /--surface/)
+  assert.match(stdout, /--kind/)
+  assert.match(stdout, /none（默认/, '用法里要写清 surface 默认 none')
 })

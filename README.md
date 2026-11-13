@@ -211,6 +211,46 @@ expert-brief --expert code-reviewer \
 - `--help` / `-h` 优先于其它选项（即使别的参数有错也只打印用法，退出 0）。
 - 选项清单以 `expert-brief --help` 为准。
 
+## 交接五段（`handoff`）
+
+同样**独立于**上面四层：它不管怎么派活，只管「换会话时前情丢不丢」。
+
+会话日志记得住「做过什么」（`tool/call`），记不住「为什么否决了方案 B」「还差哪一步」。
+于是新会话只能问人，或者从头再推一遍。这个模块把交接文档定成**固定五段**：
+
+| 段 id | 标题 | 写什么 |
+| --- | --- | --- |
+| `decided` | 已定 | 已经拍板的决定（连同理由） |
+| `rejected` | 已否决 | 试过/考虑过但否掉的路，以及为什么否 |
+| `risks` | 风险 | 已知坑、未验证的假设、可能返工的地方 |
+| `files` | 涉及文件 | 这一轮动过的/下次要动的文件（带路径） |
+| `remaining` | 待办 | 下一步具体动作与验收方式 |
+
+**缺段或空段都判不合格**（空段 = 有标题没内容）。空着的那一段恰恰是换会话最容易丢的东西，
+放行一次，下一次就没人写了。单段超过 20 行只告警，不判失败——该长就长，但太长说明该拆或该精简。
+
+```bash
+# 1. 生成五段空模板（已存在则报错，不静默覆盖；确要重来加 --force）
+node dsh-expert-team-kit/bin/handoff.mjs init --session session-abc123
+
+# 2. 逐段追加（--section 认 id，也认中文标题：decided / 已定 / rejected / 已否决 …）
+node dsh-expert-team-kit/bin/handoff.mjs append --session session-abc123 \
+  --section rejected --text "否决了方案 B：缓存一致性无法在网关层验证"
+
+# 3. 收尾核对：缺段 → 退出码 2；--json 给完整结果
+node dsh-expert-team-kit/bin/handoff.mjs check --session session-abc123 --json
+```
+
+- 落盘位置固定 `<root>/.dsh/handoffs/<session-id>.md`，`--root` 缺省 `process.cwd()`。
+- 退出码：**0** 通过 / **1** 参数或 IO 错误 / **2** 交接文档不合格（缺段、空段、文档不存在）。
+  挂进收尾脚本或 hooks 时只看退出码，不用解析文案。
+- `--json` 字段：`ok` / `missing` / `empty` / `overlong` / `counts` / `path`；
+  其中 `empty` 是 `missing` 里「有标题没内容」的那部分，两者修法不同（补标题 vs 补内容）。
+- 追加只做定点插入，不重排整份文档：手写的段序、段间空行、不属于五段的其它标题都原样保留
+  （后者在 `parseHandoff` 里落到 `extra`，不静默丢弃）。
+- 库里同名 API：`parseHandoff` / `verifyHandoff` / `formatHandoff` / `handoffPathFor` /
+  `appendToHandoff`，用法见 `dsh-expert-team-kit/bin/handoff.mjs --help`。
+
 ## 改动归属自检（`dispatch-check`）
 
 与上面四层**互相独立**的一个诊断 CLI：读 DSH 会话日志，回答「本轮的 `edit`/`write` 到底是谁执行的」。

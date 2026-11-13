@@ -36,7 +36,20 @@
  *   也不能让一次坏事件把整份报告打成异常 —— 诊断工具崩掉等于没有诊断工具。
  * - **退出码是契约**：0 = PASS、2 = 违规、1 = 出错。CI 里只判退出码，不看 stdout 文案。
  *
- * 用法见下方 USAGE；零依赖，只用 Node 内置模块。
+ * **2026-11 这一轮修掉的四个失效点**（每条都有红牙用例钉住，见 test/bin/dispatch-check.test.mjs）：
+ * - 会话来源：缺省 `latest` 按 cwd+mtime 猜会话，实测钉错会话却全 exit 0。现在缺省读
+ *   `DSH_SESSION_ID`（`--session current` / `--session-env <VAR>`），取不到 **exit 1**；
+ *   `--session latest` 默认拒绝，只有 `--allow-latest` 才按老行为跑并打警告。
+ * - 改动来源：`EDIT_TOOLS` 只有 edit/write，**bash 写文件完全不计**（60 份日志里 bash 1788 次
+ *   vs edit 252 次）。现在解析 bash 命令串里的重定向/tee/sed -i/perl -i/git apply/patch，
+ *   单列 `bashEdits`（`confidence: 'low'`）并计入 `fileCount`。
+ * - 人格判据：旧 `PERSONA_MARKERS` 含裸「人格」子串，「不要贴人格正文」也判 true。现在走
+ *   `lib/persona-check.mjs`：人格 `name` + 正文前 3 条非空行里至少 1 条（长度 >=30）原样出现。
+ *   默认只 warning，`--persona-verdict` 才进 verdict。
+ * - 归因松紧：新增 `--strict-attribution`（默认关）：主会话跨多文件改 >=2 次且子会话改动为 0
+ *   判 VIOLATION；默认只 warning（因为 childEdits=0 多半是子会话日志没落盘）。
+ *
+ * 用法见下方 USAGE；零依赖，只用 Node 内置模块（含同仓 `lib/persona-check.mjs`）。
  */
 
 import fs from 'node:fs'
@@ -44,12 +57,27 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import {
+  BODY_LINE_LIMIT,
+  MIN_BODY_LINE_LENGTH,
+  loadPersonaCorpus,
+  verifyPersonaPrompt,
+} from '../lib/persona-check.mjs'
 
 /** 退出码契约：CI 只认这三个值。 */
 export const EXIT = { PASS: 0, ERROR: 1, VIOLATION: 2 }
 
-/** 计入「改动」的工具名。 */
+/**
+ * 计入「改动」的工具名。
+ *
+ * **只有 `edit` / `write`** —— `bash` 不在这里，它走 `BASH_TOOL` + `readBashWrites`：
+ * bash 的「改没改文件」必须从命令串里尽力解析，解析结果与 edit/write 的**证据强度不同**
+ * （`confidence: 'low'`），所以两条路分开统计、分开展示，不混成一个计数。
+ */
 const EDIT_TOOLS = new Set(['edit', 'write'])
+
+/** 需要解析命令串来判断「有没有写文件」的工具名。 */
+const BASH_TOOL = 'bash'
 
 /** 计入「叫专家」的工具名。 */
 const EXPERT_TOOLS = new Set(['summon_expert', 'summon_experts', 'summon_expert_team'])
@@ -64,44 +92,45 @@ const BRIEF_TOOLS = new Set(['expert_brief'])
 const CATALOG_EVENT = 'subagent/catalog'
 
 /**
- * 「队友 prompt 里有没有专家人格」的**文本标记**。
+ * 「队友 prompt 里有没有专家人格」的**旧版结构标记**（已降级，不再决定判定）。
  *
- * 判定的是「prompt 命中了专家人格的招牌字句」，不是「prompt 写得像不像任务书」——
- * 一个字节 persona 都没有的 prompt 也可能很长、很细致（真实事故里 6988 字节的 prompt
- * 一个标记都不命中），所以只能按 persona md 的固定骨架来认。
+ * 历史问题（本次修复的第三个失效点）：这组标记里含一个裸「人格」子串，于是
+ * 「…不要贴人格正文」这种**明确禁止贴正文**的句子也会判成「有人格」—— 判据对
+ * 「提到」与「贴了」不区分，方向正好反了。
  *
- * 这几条都是 `expert_brief` 拼出来的任务书与 `assets/agency-agents/**` 人格正文里的
- * **稳定骨架**（标题 `## Core Mission`、`## Critical Rules`、`# <Name> Agent`、
- * `**Agent Personality**`、正文里的「人格」二字等）。放宽到「提到专家名」就会把
- * 「你是 frontend-developer」判成「有人格」，而名字恰恰是事故里唯一对的东西。
+ * 现在的判定走 `lib/persona-check.mjs` 的 `verifyPersonaPrompt`（人格 name + 正文行原样出现）。
+ * 这个导出**保留**（外部消费者可能 import），但只作为「结构上像不像人格正文」的弱信号，
+ * 且已去掉裸「人格」。**不要再拿它当判定依据。**
  */
-export const PERSONA_MARKERS = [
-  'You are **',
-  'Agent Personality',
-  'Core Mission',
-  'Critical Rules',
-  'Identity',
-  '人格',
-]
+export const PERSONA_MARKERS = ['You are **', 'Agent Personality', 'Core Mission', 'Critical Rules', 'Identity']
 
-/** 人格正文的 Markdown 标题形态，如 `# Code Reviewer Agent` / `# Frontend Developer Agent`。 */
+/**
+ * 人格正文的 Markdown 标题形态，如 `# Code Reviewer Agent`。
+ *
+ * 与 `PERSONA_MARKERS` 一样是**旧判据的遗留导出**（外部消费者可能 import），不再参与判定：
+ * 它只能证明「贴了个像人格的标题」，证明不了「贴的是哪一位、正文有没有进来」。
+ */
 export const PERSONA_HEADING_RE = /#\s+\w[\w ]*Agent\b/
 
 /** `samples` 最多留几个队友名（只是给人看的线索，不承担准确性）。 */
 export const PERSONA_SAMPLE_LIMIT = 5
 
 /**
- * 这段 prompt 文本里有没有专家人格的痕迹。
+ * 这段 prompt 文本里有没有**那位专家**的人格。
  *
- * 空串 / 非字符串一律 `false`：空 prompt 显然没人格（它连任务都没有）。
+ * 判据见 `lib/persona-check.mjs`：必须同时命中某人格 frontmatter 的 `name` 值与
+ * 该人格正文前 3 条非空行里至少 1 条（长度 >= 30）的**原样**文本。
+ * 只提到名字不算（真实事故里名字恰恰是对的，正文一个字节都没有）。
+ *
+ * `personas` 缺失/为空时返回 `false` —— 但那是「没法判」，调用方（`countDispatch`）
+ * 会把它记成 `unavailable` 并跳过计数，**不能**当成「检查过且没人格」。
  *
  * @param {unknown} prompt
+ * @param {{personas?: {name: string, bodyLines?: string[]}[]}} [options]
  * @returns {boolean}
  */
-export function hasPersona(prompt) {
-  if (typeof prompt !== 'string' || prompt === '') return false
-  if (PERSONA_MARKERS.some((marker) => prompt.includes(marker))) return true
-  return PERSONA_HEADING_RE.test(prompt)
+export function hasPersona(prompt, { personas } = {}) {
+  return verifyPersonaPrompt(prompt, { personas }).ok
 }
 
 /**
@@ -146,10 +175,13 @@ const LOG_BASENAMES = ['session.v4.jsonl.zstd', 'session.jsonl', 'session.v4.jso
 const MAX_DECOMPRESS_BYTES = 1024 * 1024 * 1024
 
 const USAGE = `用法：
-  dispatch-check [--session <dir|id|latest>] [--cwd <路径>] [--any-cwd] [--json] [--help]
+  dispatch-check [--session <dir|id|latest>] [--cwd <路径>] [--any-cwd]
+                 [--session current] [--session-env <变量名>] [--allow-latest]
+                 [--persona-root <目录>] [--persona-verdict]
+                 [--strict-attribution] [--json] [--help]
 
-读 DSH 会话日志，统计本轮的 edit/write 由谁执行（主会话 vs 子 agent），
-给出 PASS / VIOLATION 结论。只读，不修改任何会话文件。
+读 DSH 会话日志，统计本轮的 edit/write（以及 bash 里的写文件操作）由谁执行
+（主会话 vs 子 agent），给出 PASS / VIOLATION 结论。只读，不修改任何会话文件。
 
 判据只看「主会话自己改了多少 / 跨几个文件」＋「有没有派过实现队友」（只看 subagent /
 subagent_fork）。子会话日志读不到时只降低归因精度，不构成违规 —— 实测子会话
@@ -159,36 +191,48 @@ subagent_fork）。子会话日志读不到时只降低归因精度，不构成�
 
 选项：
   --session <dir|id|latest>  会话目录路径、session uuid（支持前缀）或 latest
-                             缺省 latest（取最近一次会话，规则见下）
+                             缺省：从环境变量取会话 id（见下「选会话规则」）
+  --session current          显式要求「用环境变量里的会话 id」（与缺省同义，写出来更明确）
+  --session-env <变量名>     换一个环境变量名来取会话 id（缺省 DSH_SESSION_ID）
+  --allow-latest             允许 --session latest 按老行为跑（**会钉错会话**，仅逃生用；
+                             打印 stderr 警告）
   --cwd <路径>               只在这些 cwd 匹配的 workspace 里找会话（硬筛，匹配不到退出 1）
-                             缺省：--session latest 时按当前目录匹配，见下
-  --any-cwd                  --session latest 时**忽略当前目录**，回到「全盘 mtime 最新」
-                             的旧行为（逃生口）
+  --any-cwd                  --session latest --allow-latest 时忽略当前目录，回到「全盘最新」
+                             的旧行为（按 mtime 取，逃生口）
+  --persona-root <目录>      人格清单根目录（缺省扫专家插件 assets/agency-agents）
+  --persona-verdict          把「队友 prompt 缺专家人格」也算进 verdict（缺则 VIOLATION）
+  --strict-attribution       开启严格归因：主会话跨多个文件改 >=2 次、而子会话改动为 0 时判
+                             VIOLATION（缺省只 warning）
   --json                     只输出一份 JSON（便于脚本消费）
   -h, --help                 打印本用法并退出 0
 
-选会话规则（只对 --session latest 生效；给目录路径或 uuid 时一律按你给的选）：
-  缺省把 --cwd 当成**当前目录**（process.cwd()）：在哪个工作区跑就解析哪个工作区的
-  会话 —— 因为 latest 老行为是「全盘 mtime 最新」，挂进 verify（在会话 cwd 下执行、
-  拿不到会话 id）时会读到别的工作区，检查错会话。
-  这是**软默认**：当前目录下一条会话都没有时退回「全盘最新」而不是报错（在从没跑过
-  会话的新目录里跑 verify 不该因此失败）。显式给 --cwd 则是硬筛，匹配不到直接报错。
-  想关掉这个默认（比如故意要看全盘最新的会话），加 --any-cwd。
+选会话规则：
+  1. 显式 --session <目录|uuid|uuid 前缀> 一律按你给的选（最确定，推荐）。
+  2. 显式 --session current 或**缺省**：从环境变量（缺省 DSH_SESSION_ID，可用
+     --session-env 换名）取会话 id。**取不到就退出 1，绝不回退 latest** —— 回退会
+     静默检查错会话（实测 26 次 verify 全部 exit 0，钉的都不是当前会话）。
+  3. --session latest：仍解析，但**默认退出 1** 并说明它会钉错会话。要按老行为跑必须
+     同时给 --allow-latest（会在 stderr 打警告）。老行为把 --cwd 缺省当成当前目录
+     （process.cwd()），并用 --any-cwd 关掉这一默认。
 
 退出码：
   0   PASS       主会话没改，或只改单文件，或本轮确实派过实现队友（subagent/subagent_fork）
-  2   VIOLATION  跨多个文件的主会话改动，且本轮 subagent 0 次（只叫专家 / 只写任务书 / 只有子会话登记都不算）
-  1   错误       找不到会话 / 参数错 / 日志不可读
+  2   VIOLATION  跨多个文件的主会话改动，且本轮 subagent 0 次（只叫专家 / 只写任务书 /
+                 只有子会话登记都不算）；--strict-attribution / --persona-verdict 会额外加判据
+  1   错误       找不到会话 / 取不到会话 id / 参数错 / 日志不可读
 
 环境变量：
   DSH_SESSIONS_DIR  会话根目录，缺省 ~/.dsh/sessions（测试与多 DSH_HOME 场景用）
+  DSH_SESSION_ID    当前会话 id（--session 缺省与 --session current 读它；可用 --session-env 换名）
+  DSH_PERSONA_ROOT  人格清单根目录（等价 --persona-root）
 
 示例：
-  dispatch-check --session latest
-  dispatch-check --session latest --any-cwd
-  dispatch-check --session ebab78bb --json
-  dispatch-check --session ~/.dsh/sessions/--x--/session-<uuid> 
-  dispatch-check --cwd /path/to/project
+  dispatch-check                                   # 用 DSH_SESSION_ID
+  dispatch-check --session current --json
+  dispatch-check --session-env MY_SESSION_ID
+  dispatch-check --session ebab78bb --json          # uuid 前缀
+  dispatch-check --session ~/.dsh/sessions/--x--/session-<uuid>
+  dispatch-check --session latest --allow-latest --any-cwd   # 老行为逃生口
 `
 
 /**
@@ -208,12 +252,28 @@ class CliError extends Error {
  *
  * `--help` 优先于一切：只要出现就立刻返回，不再校验别的参数（调试时最怕「想看用法却先被参数错误打断」）。
  *
+ * `session` 的缺省值是 **null**（＝「从环境变量取会话 id」），不是 `'latest'`。
+ * 这个改动是本次修复的核心之一：缺省 `latest` 会按 cwd+mtime 猜会话，实测钉错会话
+ * （26 次 oracle 执行全 exit 0，检查的根本不是当前会话）。null 表示「用户没指名」，
+ * 由 `resolveSelector` 决定去读环境变量，读不到就报错，绝不猜。
+ *
  * @param {string[]} argv 不含 node 与脚本路径的参数
- * @returns {{session: string, cwd: string|null, anyCwd: boolean, json: boolean, help: boolean}}
+ * @returns {{session: string|null, cwd: string|null, anyCwd: boolean, json: boolean, help: boolean, allowLatest: boolean, sessionEnv: string|null, personaRoot: string|null, personaVerdict: boolean, strictAttribution: boolean}}
  * @throws {CliError} 未知参数 / 选项缺值
  */
 export function parseArgs(argv) {
-  const opts = { session: 'latest', cwd: null, anyCwd: false, json: false, help: false }
+  const opts = {
+    session: null,
+    cwd: null,
+    anyCwd: false,
+    json: false,
+    help: false,
+    allowLatest: false,
+    sessionEnv: null,
+    personaRoot: null,
+    personaVerdict: false,
+    strictAttribution: false,
+  }
   const list = Array.isArray(argv) ? argv : []
 
   // `--help` 先整体扫描一遍再逐项解析：像 `--session --help` 这种「想看用法」的输入
@@ -223,6 +283,30 @@ export function parseArgs(argv) {
     return opts
   }
 
+  /** 取下一个参数作为取值；缺值/取值像另一个选项都报错（`--cwd --json` 不能把 --json 当路径）。 */
+  const takeValue = (flag, index) => {
+    const value = list[index + 1]
+    if (value === undefined || value === '' || value.startsWith('-')) {
+      throw new CliError(`选项 ${flag} 缺少取值`, `改成 ${flag} <值>，或先跑 dispatch-check --help 看用法`)
+    }
+    return value
+  }
+
+  const BOOLEAN_FLAGS = {
+    '--json': 'json',
+    '--any-cwd': 'anyCwd',
+    '--allow-latest': 'allowLatest',
+    '--persona-verdict': 'personaVerdict',
+    '--strict-attribution': 'strictAttribution',
+  }
+
+  const VALUE_FLAGS = {
+    '--session': 'session',
+    '--cwd': 'cwd',
+    '--session-env': 'sessionEnv',
+    '--persona-root': 'personaRoot',
+  }
+
   for (let i = 0; i < list.length; i += 1) {
     const arg = list[i]
 
@@ -230,40 +314,31 @@ export function parseArgs(argv) {
       opts.help = true
       return opts
     }
-    if (arg === '--json') {
-      opts.json = true
-      continue
-    }
-    if (arg === '--any-cwd') {
-      opts.anyCwd = true
+    if (Object.prototype.hasOwnProperty.call(BOOLEAN_FLAGS, arg)) {
+      opts[BOOLEAN_FLAGS[arg]] = true
       continue
     }
 
-    // 同时接受 `--session value` 与 `--session=value` 两种写法。
-    if (arg === '--session' || arg === '--cwd') {
-      const value = list[i + 1]
-      if (value === undefined || value === '' || value.startsWith('-')) {
-        throw new CliError(`选项 ${arg} 缺少取值`, `改成 ${arg} <值>，或先跑 dispatch-check --help 看用法`)
-      }
+    // 同时接受 `--flag value` 与 `--flag=value` 两种写法。
+    if (Object.prototype.hasOwnProperty.call(VALUE_FLAGS, arg)) {
+      opts[VALUE_FLAGS[arg]] = takeValue(arg, i)
       i += 1
-      if (arg === '--session') opts.session = value
-      else opts.cwd = value
       continue
     }
-    if (arg.startsWith('--session=') || arg.startsWith('--cwd=')) {
-      const [flag, ...rest] = arg.split('=')
-      const value = rest.join('=')
-      if (value === '') {
-        throw new CliError(`选项 ${flag} 缺少取值`, `改成 ${flag} <值>，或先跑 dispatch-check --help 看用法`)
+    if (arg.startsWith('--') && arg.includes('=')) {
+      const at = arg.indexOf('=')
+      const flag = arg.slice(0, at)
+      const value = arg.slice(at + 1)
+      if (Object.prototype.hasOwnProperty.call(VALUE_FLAGS, flag)) {
+        if (value === '') throw new CliError(`选项 ${flag} 缺少取值`, `改成 ${flag} <值>，或先跑 dispatch-check --help 看用法`)
+        opts[VALUE_FLAGS[flag]] = value
+        continue
       }
-      if (flag === '--session') opts.session = value
-      else opts.cwd = value
-      continue
     }
 
     throw new CliError(
       `未知参数：${arg}`,
-      '可用参数只有 --session / --cwd / --any-cwd / --json / --help；跑 --help 看用法',
+      '可用参数只有 --session / --session-env / --cwd / --any-cwd / --allow-latest / --persona-root / --persona-verdict / --strict-attribution / --json / --help；跑 --help 看用法',
     )
   }
 
@@ -277,6 +352,57 @@ export function sessionsRoot(env = process.env) {
   return path.join(os.homedir(), '.dsh', 'sessions')
 }
 
+/** 取「当前会话 id」的缺省环境变量名（`--session current` 与 `--session` 缺省都读它）。 */
+export const SESSION_ENV_VAR = 'DSH_SESSION_ID'
+
+/**
+ * 把「用户怎么指定会话」解析成一个真正的选择器。
+ *
+ * 这一步是本次修复的**核心**：老版把 `--session` 的缺省值写成 `latest`，于是不指定会话时
+ * 就按 cwd+mtime 猜，实测会钉错会话（26 次 oracle 执行全部 exit 0，检查的根本不是当前会话）。
+ * 现在缺省是「读环境变量给你当前会话 id」，读不到就 **exit 1**，绝不回退 latest。
+ *
+ * 三种输入：
+ * - `null` / 空串 / `current` / `env`：读环境变量（名可用 `--session-env` 换），空值报错；
+ * - `latest`：**默认拒绝**（提示会钉错会话），只有 `--allow-latest` 才放行并标 `latest-allowed`；
+ * - 其它：原样当目录/uuid 前缀，语义与老版一致。
+ *
+ * @param {{session?: string|null, sessionEnv?: string|null, allowLatest?: boolean, env?: Record<string,string|undefined>}} [options]
+ * @returns {{session: string, source: 'env'|'explicit'|'latest-allowed', envName: string}}
+ * @throws {CliError} 环境变量取不到 / 环境变量值是 latest / latest 未获放行
+ */
+export function resolveSelector({ session = null, sessionEnv = null, allowLatest = false, env = process.env } = {}) {
+  const envName = typeof sessionEnv === 'string' && sessionEnv.trim() !== '' ? sessionEnv.trim() : SESSION_ENV_VAR
+  const raw = session === undefined || session === null ? null : String(session).trim()
+
+  if (raw === 'latest') {
+    if (allowLatest) return { session: 'latest', source: 'latest-allowed', envName }
+    throw new CliError(
+      '--session latest 会按 cwd+mtime 猜会话，实测钉错过会话（检查的不是当前会话却 exit 0），已默认拒绝',
+      '改成 --session current（读环境变量里的会话 id）或 --session <uuid|会话目录>；确认就是要看「最近一次会话」再加 --allow-latest',
+    )
+  }
+
+  if (raw === null || raw === '' || raw === 'current' || raw === 'env') {
+    const value = env && env[envName] !== undefined && env[envName] !== null ? String(env[envName]).trim() : ''
+    if (value === '') {
+      throw new CliError(
+        `取不到当前会话 id：环境变量 ${envName} 未设置或为空（--session 缺省与 --session current 都读它）`,
+        `三种办法：① 在 DSH 会话里跑（宿主会注入 ${envName}）；② 显式 --session <uuid|会话目录>；③ --session-env <变量名> 指定别的变量名`,
+      )
+    }
+    if (value === 'latest') {
+      throw new CliError(
+        `环境变量 ${envName} 的值是 latest，不是会话 id（会重新掉进「猜会话」的坑）`,
+        `把它设成真实会话 uuid，或显式 --session <uuid|会话目录>`,
+      )
+    }
+    return { session: value, source: 'env', envName }
+  }
+
+  return { session: raw, source: 'explicit', envName }
+}
+
 /** 目录不存在时返回 []，绝不抛（缺目录是「没有会话」，不是「出错」）。 */
 function safeReaddir(dir) {
   try {
@@ -286,10 +412,26 @@ function safeReaddir(dir) {
   }
 }
 
-/** 一个 workspace 目录下的所有 `session-*` 会话目录。 */
+/** 目录名看起来像一个会话 id（uuid，含任意位置的重叠 uuid 前缀）。 */
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * 一个 workspace 目录下的所有会话目录。
+ *
+ * **两种真实布局都要认**（实测同一个 sessions 根下同时存在，且新布局占多数）：
+ * - 老布局：`session-<uuid>`（本机 101 个）
+ * - 新布局：裸 `<uuid>`（本机 285 个，当前正在写的会话就是这种）
+ *
+ * 老实现只认 `session-` 前缀，后果是 `--session <uuid>` 对**正在跑的会话**永远找不到
+ * （它的目录是裸 uuid），`latest` 也只能看见老布局 —— 「按会话 id 定位」这件事根本没生效。
+ */
 function sessionDirsIn(workspaceDir) {
   return safeReaddir(workspaceDir)
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith('session-'))
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        (entry.name.startsWith('session-') || SESSION_ID_RE.test(entry.name) || resolveLogFile(path.join(workspaceDir, entry.name)) !== null),
+    )
     .map((entry) => path.join(workspaceDir, entry.name))
 }
 
@@ -419,15 +561,274 @@ export function readEditTarget(event) {
 }
 
 /**
- * 统计一个会话事件流里的 edit/write。
+ * 从一条 `bash` 的 `tool/call` 里取命令串。
  *
- * @returns {{edits: number, files: string[], experts: number, warnings: string[]}}
+ * `arguments` 是 JSON 字符串，字段名可能是 `command`（真机）或 `cmd`（旧/别名形态），
+ * 两个都认。任何异常返回 `{ ok: false, reason }`，绝不抛。
+ *
+ * @returns {{ok: true, command: string} | {ok: false, reason: string}}
+ */
+export function readBashCommand(event) {
+  const raw = event && event.data ? event.data.arguments : undefined
+
+  if (typeof raw !== 'string') {
+    return { ok: false, reason: `arguments 不是字符串（${raw === undefined ? 'undefined' : typeof raw}）` }
+  }
+  if (raw.trim() === '') return { ok: false, reason: 'arguments 是空字符串' }
+
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    return { ok: false, reason: `arguments 不是合法 JSON（${error.message}）` }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, reason: 'arguments 不是 JSON 对象' }
+  }
+
+  const command = typeof parsed.command === 'string' ? parsed.command : typeof parsed.cmd === 'string' ? parsed.cmd : null
+  if (command === null) {
+    return { ok: false, reason: `缺少 command（${parsed.command === undefined ? 'undefined' : typeof parsed.command}）` }
+  }
+  return { ok: true, command }
+}
+
+/** 重定向目标里这些不是「文件」：`/dev/null`、`&1`、`&2`、`/dev/stdout` 等。 */
+const NON_FILE_TARGETS = new Set(['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty', '&1', '&2', '-'])
+
+/** 一个写操作（bash 解析出来的，证据强度低 —— 只是「命令串里看起来在写这个文件」）。 */
+export const BASH_WRITE_KINDS = /** @type {const} */ (['redirect', 'tee', 'sed-in-place', 'perl-in-place', 'git-apply', 'patch'])
+
+/** `sed` / `perl` 的原地修改标志：`-i`、`-i.bak`、`-Ei`、`-pi` 等。 */
+const IN_PLACE_RE = /(?:^|\s)-[a-zA-Z]*i(?:\.\S+)?(?:\s|$)/
+
+/** 从一段命令里挑出「最后一个不含引号、不像重定向的 token」当作目标路径。 */
+function lastPathToken(segment) {
+  const tokens = segment.match(/(?:'[^']*'|"[^"]*"|\S+)/g) || []
+  for (let i = tokens.length - 1; i >= 0; i -= 1) {
+    const token = tokens[i].replace(/^['"]|['"]$/g, '')
+    if (token === '' || token.startsWith('-') || token.startsWith('&') || /^[0-9]*[<>]/.test(token)) continue
+    if (NON_FILE_TARGETS.has(token)) continue
+    return token
+  }
+  return null
+}
+
+/**
+ * 按 shell 分隔符切段，但**跳过引号内部**的分隔符。
+ *
+ * 只处理 `'` 与 `"` 两种引号与反斜杠转义；heredoc / 命令替换不做特判（够了 ——
+ * 我们只需要「不要把引号里的 `|` 当管道」这一件事）。
+ *
+ * @param {string} command
+ * @returns {string[]}
+ */
+export function splitShellSegments(command) {
+  const text = typeof command === 'string' ? command : ''
+  const segments = []
+  let current = ''
+  let quote = null
+
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i]
+
+    if (quote) {
+      current += char
+      if (char === '\\' && i + 1 < text.length) {
+        current += text[i + 1]
+        i += 1
+        continue
+      }
+      if (char === quote) quote = null
+      continue
+    }
+
+    if (char === '\\' && i + 1 < text.length) {
+      current += char + text[i + 1]
+      i += 1
+      continue
+    }
+    if (char === "'" || char === '"') {
+      quote = char
+      current += char
+      continue
+    }
+    if (char === '\n' || char === ';') {
+      segments.push(current)
+      current = ''
+      continue
+    }
+    if (char === '&' && text[i + 1] === '&') {
+      segments.push(current)
+      current = ''
+      i += 1
+      continue
+    }
+    if (char === '|') {
+      if (text[i + 1] === '|') i += 1
+      segments.push(current)
+      current = ''
+      continue
+    }
+    current += char
+  }
+
+  segments.push(current)
+  return segments
+}
+
+/** 像路径的字符集（ASCII，不含空白/引号/CJK/括号/反引号）。 */
+const PATH_SHAPE_RE = /^[\w@%+.,:/~^$\-]+$/
+
+/**
+ * 这个 token 像不像一个「文件路径」。
+ *
+ * 为什么必须卡这一道：命令串里到处是 `>= 30`、`2>&1`、`a > b` 这类**不是重定向**的 `>`。
+ * 不卡的话，`>= 30` 会被读成「把内容写进 `=30`」，报告里立刻多出一堆垃圾路径（真实跑过一次：
+ * 60 条 bashEdits 里大半是 `=30`、`0)`、`是**读**操作`）—— 那比不检测更糟，因为读者会
+ * 以为工具在瞎报。
+ *
+ * 判据：ASCII 路径字符集 + 不是纯数字/纯符号 + （含 `/` 或带扩展名）。
+ */
+export function looksLikePath(target) {
+  if (typeof target !== 'string' || target === '') return false
+  if (!PATH_SHAPE_RE.test(target)) return false
+  if (/^\d+$/.test(target)) return false
+  if (/^[=+\-]+$/.test(target)) return false
+  return target.includes('/') || /\.[A-Za-z0-9]+$/.test(target)
+}
+
+/** argv 类目标（tee / sed -i / git apply / patch）的宽松校验：只要不是空白、CJK、选项即可。 */
+function looksLikeArgvPath(target) {
+  if (typeof target !== 'string' || target === '') return false
+  if (/^[=-]+$/.test(target)) return false
+  return PATH_SHAPE_RE.test(target)
+}
+
+/**
+ * 从一段 bash 命令串里**尽力**解析出写操作与目标路径。
+ *
+ * 为什么「尽力」就够：bash 能写文件的方式无穷（`python -c`、`node -e`、`xxd -r`…），
+ * 想要完备是不可能的。这里只覆盖工位上真正高频的 6 类（见 `BASH_WRITE_KINDS`），
+ * 并把结论标成 `confidence: 'low'` —— 它用于**提高可见性**，不用于精确判定。
+ * 解析不出路径的写操作会计进 `unparsed`，由调用方写进 warning（不能静默丢）。
+ *
+ * 明确不认的形态（免得把自己骗了）：
+ * - 引号里的 `>` 是数据不是重定向 —— 先按引号切 token 再判断；
+ * - `2>&1` / `>/dev/null` 不是写文件；
+ * - `--dry-run` 之类的 flag 不作特殊处理（宁可多算一次，不静默少算）。
+ *
+ * @param {unknown} command
+ * @returns {{writes: {path: string, kind: string}[], unparsed: number, isWrite: boolean}}
+ */
+export function extractBashWrites(command) {
+  if (typeof command !== 'string' || command.trim() === '') {
+    return { writes: [], unparsed: 0, isWrite: false }
+  }
+
+  const writes = []
+  let unparsed = 0
+  /**
+   * 记一处写操作。
+   * - `missingTarget`：命令确实在写，但取不到目标（如行尾 `> `）→ 计 unparsed，留 warning；
+   * - 目标存在但不像路径（`2>&1`、`>=`、引号里的 `a > b`）→ 当作**不是**写文件，静默跳过。
+   *   这一条很重要：把 `>=` 当写操作会在报告里造垃圾路径，噪声会让人不再看报告。
+   */
+  const add = (target, kind, { strictShape = true } = {}) => {
+    if (!target) {
+      unparsed += 1
+      return
+    }
+    if (NON_FILE_TARGETS.has(target)) return
+    const ok = strictShape ? looksLikePath(target) : looksLikeArgvPath(target)
+    if (!ok) return
+    writes.push({ path: target, kind })
+  }
+
+  // 按 shell 分隔符切段：`&&`、`||`、`;`、`|`、换行。管道两侧各算一段，
+  // `tee` 正好出现在管道右侧。切段后再判重定向，避免跨段串味。
+  //
+  // **必须引号安全**：`sed -i "s|a|b|" f.ts` 里的 `|` 是 sed 的分隔符，不是管道。
+  // 按字符朴素切分的话它会切成 `sed -i "s` / `a` / `b"` / `f.ts`，前一段就会被当成
+  // 「sed 原地改文件 s」—— 又一个垃圾路径（真机踩过一次）。
+  const segments = splitShellSegments(command)
+
+  /** 引号安全的 token 化：`"a b"` 算一个 token。 */
+  const tokenize = (text) => text.match(/(?:'[^']*'|"[^"]*"|\S+)/g) || []
+  const unquote = (token) => token.replace(/^['"]|['"]$/g, '')
+
+  for (const segment of segments) {
+    const text = segment.trim()
+    if (text === '') continue
+    const tokens = tokenize(text)
+
+    // ① 重定向：`> f` / `>> f` / `2> f` / `1>f`。`>&2`、`2>&1`、`>/dev/null` 不算写文件。
+    for (let i = 0; i < tokens.length; i += 1) {
+      const token = tokens[i]
+      const inline = /^\d*(?:>>?|&>)(.*)$/.exec(token)
+      if (!inline) continue
+
+      const rest = unquote(inline[1])
+      if (rest.startsWith('&')) continue // `2>&1` / `>&2`：目标不是文件
+      if (rest.startsWith('=')) continue // `>=` / `>>=`：比较运算符，不是重定向
+      if (rest !== '') {
+        add(rest, 'redirect') // `>f` / `2>f`
+        continue
+      }
+      const next = tokens[i + 1] === undefined ? null : unquote(tokens[i + 1])
+      if (next === null) unparsed += 1 // `> ` 后面没东西：写操作存在但目标不明
+      else add(next, 'redirect') // `> f`
+    }
+
+    const first = unquote(tokens[0] || '')
+
+    // ② tee（可选 -a）
+    if (first === 'tee') {
+      add(lastPathToken(text), 'tee', { strictShape: false })
+      continue
+    }
+
+    // ③ sed -i / perl -i：目标通常是最后一个路径参数
+    if ((first === 'sed' || first === 'perl') && IN_PLACE_RE.test(text)) {
+      const target = lastPathToken(text)
+      add(target && target !== first ? target : null, first === 'sed' ? 'sed-in-place' : 'perl-in-place')
+      continue
+    }
+
+    // ④ git apply <patch>
+    if (first === 'git' && /^\s*git\s+apply\b/.test(text)) {
+      add(lastPathToken(text.replace(/^\s*git\s+apply\b/, '')), 'git-apply')
+      continue
+    }
+
+    // ⑤ patch -p<N> [file]
+    if (first === 'patch' && /(?:^|\s)-p\s*\d/.test(text)) {
+      const target = lastPathToken(text)
+      add(target && target !== first ? target : null, 'patch')
+      continue
+    }
+  }
+
+  return { writes, unparsed, isWrite: writes.length > 0 || unparsed > 0 }
+}
+
+/**
+ * 统计一个会话事件流里的 edit/write（以及 bash 里的写文件操作）。
+ *
+ * `bashEdits` / `bashFiles` 与 `edits` / `files` **分开返回**：前者的证据强度是
+ * `confidence: 'low'`（从命令串猜的），后者是结构化的 `file_path`。混成一个数字，
+ * 报告里就再也分不清「真的调了 edit」和「命令里看起来像写了个文件」。
+ *
+ * @returns {{edits: number, files: string[], experts: number, bashEdits: number, bashFiles: string[], bashWrites: {path: string, kind: string}[], warnings: string[]}}
  */
 export function countCalls(events, scope = '主会话') {
   const files = []
+  const bashFiles = []
+  const bashWrites = []
   const warnings = []
   let edits = 0
   let experts = 0
+  let bashEdits = 0
 
   for (const event of events) {
     if (!event || event.type !== 'tool/call') continue
@@ -444,10 +845,38 @@ export function countCalls(events, scope = '主会话') {
       }
       continue
     }
+    if (name === BASH_TOOL) {
+      const read = readBashCommand(event)
+      if (!read.ok) {
+        // bash 解析不出命令串不影响 edit 结论；但「有一次 bash 不知道写了什么」必须留痕，
+        // 否则结论看起来比实际更确定（这是本工具最要避免的静默形态）。
+        warnings.push(`${scope}有一次 bash 调用无法解析（${read.reason}），其中的写文件操作未计入`)
+        continue
+      }
+      const parsed = extractBashWrites(read.command)
+      if (parsed.writes.length === 0 && parsed.unparsed === 0) continue
+      bashEdits += parsed.writes.length
+      for (const write of parsed.writes) {
+        bashFiles.push(write.path)
+        bashWrites.push(write)
+      }
+      if (parsed.writes.length > 0) {
+        warnings.push(
+          `${scope}有 ${parsed.writes.length} 处 bash 写文件操作（confidence: low，从命令串解析）：` +
+            `${parsed.writes.map((write) => `${write.kind} ${write.path}`).join('、')}`,
+        )
+      }
+      if (parsed.unparsed > 0) {
+        warnings.push(
+          `${scope}有 ${parsed.unparsed} 处 bash 写操作识别不出目标路径（如管道/变量拼接），未计入改动文件`,
+        )
+      }
+      continue
+    }
     if (EXPERT_TOOLS.has(name)) experts += 1
   }
 
-  return { edits, files, experts, warnings }
+  return { edits, files, experts, bashEdits, bashFiles, bashWrites, warnings }
 }
 
 /**
@@ -474,9 +903,13 @@ export function countCalls(events, scope = '主会话') {
  *
  * @param {any[]} events
  * @param {string[]} [warnings] 解析异常时追加 warning 的数组（不传则只丢给 console 之外的调用方忽略）
- * @returns {{subagents: number, expertCalls: number, briefs: number, catalog: number, persona: {checked: number, missing: number, samples: string[]}}}
+ * @param {{personas?: {name: string, bodyLines?: string[]}[], personaUnavailableReason?: string|null, diagnostics?: {personaUnavailable?: string|null}}} [options]
+ *   `personas` 是人格清单（来自 `loadPersonaCorpus`）。**清单不可用时不计数**，只记 warning 并
+ *   在 `persona.unavailable` 里留原因 —— 「扫不到清单」与「队友没带人格」是两件事，
+ *   混为一谈会让一批会话凭空多出一堆「缺人格」结论。
+ * @returns {{subagents: number, expertCalls: number, briefs: number, catalog: number, persona: {checked: number, missing: number, samples: string[], unavailable: string|null}}}
  */
-export function countDispatch(events, warnings = []) {
+export function countDispatch(events, warnings = [], { personas = [], personaUnavailableReason = null, diagnostics = null } = {}) {
   const dispatch = {
     subagents: 0,
     expertCalls: 0,
@@ -484,6 +917,9 @@ export function countDispatch(events, warnings = []) {
     catalog: 0,
     persona: { checked: 0, missing: 0, samples: [] },
   }
+  const canCheckPersona = Array.isArray(personas) && personas.length > 0
+  // `unavailable` 只在真出现「需要判却判不了」时才有值（见下方 subagent 分支）。
+  let personaUnavailable = null
 
   for (const event of Array.isArray(events) ? events : []) {
     if (!event) continue
@@ -504,8 +940,18 @@ export function countDispatch(events, warnings = []) {
         warnings.push(`有一次 ${name} 调用无法解析（${read.reason}），人格检查跳过，不计入 checked`)
         continue
       }
+      if (!canCheckPersona) {
+        // 清单不可用：不能计 checked（等于编造「检查过」），也不能算 missing（等于编造「没人格」）。
+        personaUnavailable = personaUnavailableReason || '人格清单不可用（为空或未提供）'
+        continue
+      }
+      const verdict = verifyPersonaPrompt(read.prompt, { personas })
+      if (verdict.unavailable) {
+        personaUnavailable = verdict.reason
+        continue
+      }
       dispatch.persona.checked += 1
-      if (!hasPersona(read.prompt)) {
+      if (!verdict.ok) {
         dispatch.persona.missing += 1
         if (dispatch.persona.samples.length < PERSONA_SAMPLE_LIMIT) {
           dispatch.persona.samples.push(read.name || `(未命名队友 #${dispatch.persona.checked})`)
@@ -514,6 +960,13 @@ export function countDispatch(events, warnings = []) {
     } else if (EXPERT_TOOLS.has(name)) dispatch.expertCalls += 1
     else if (BRIEF_TOOLS.has(name)) dispatch.briefs += 1
   }
+
+  if (personaUnavailable) {
+    warnings.push(`人格检查未执行：${personaUnavailable}—— 这一项不参与判定，也不代表队友没带人格`)
+  }
+  // `unavailable` 走 `diagnostics` 传出，**不挂到 dispatch 上**：`dispatch` 的字段是既有契约
+  // （测试与外部脚本按全等比较），多一个键就会静默破坏它们。
+  if (diagnostics && typeof diagnostics === 'object') diagnostics.personaUnavailable = personaUnavailable
 
   return dispatch
 }
@@ -670,10 +1123,10 @@ function hintForMissingSession(root, wanted) {
     .map((dir) => path.basename(path.dirname(dir)) + '/' + path.basename(dir))
 
   const lines = [
-    '  - 用 --session latest 取最近一次会话（缺省按当前目录匹配，--any-cwd 可关）',
-    '  - 用 --any-cwd 忽略当前目录限制，回到「全盘最新」',
-    '  - 用 --session <uuid> 或 uuid 前缀（会匹配 session-<uuid>*）',
+    `  - 不给 --session 时读环境变量 ${SESSION_ENV_VAR}（DSH 会话里通常已注入）；取不到会报错而不是猜`,
+    '  - 用 --session <uuid> 或 uuid 前缀（两种目录布局 session-<uuid> / <uuid> 都认）',
     '  - 用 --session <会话目录绝对路径> 直接指定',
+    '  - 确实要看「最近一次会话」：--session latest --allow-latest（会按 cwd+mtime 猜，可能选错）',
   ]
   if (recent.length > 0) lines.push(`  - ${root} 下最近的会话：${recent.join(' / ')}`)
   else lines.push(`  - ${root} 下一个会话目录都没有：确认 DSH 至少跑过一次，或检查 DSH_SESSIONS_DIR`)
@@ -760,8 +1213,13 @@ export function resolveSession({ session = 'latest', cwd = null, root = sessions
     return { dir, resolvedBy: 'latest', cwdFallback }
   }
 
-  const wanted = selector.startsWith('session-') ? selector : `session-${selector}`
-  const matched = candidates.filter((dir) => path.basename(dir).startsWith(wanted))
+  // 选择器去掉可选的 `session-` 前缀后是「会话 id 前缀」，两种目录名都要匹配得上。
+  const wantedId = selector.startsWith('session-') ? selector.slice('session-'.length) : selector
+  const matched = candidates.filter((dir) => {
+    const base = path.basename(dir)
+    const id = base.startsWith('session-') ? base.slice('session-'.length) : base
+    return id.startsWith(wantedId)
+  })
   if (matched.length === 0) {
     throw new CliError(hintForMissingSession(root, selector), null)
   }
@@ -771,13 +1229,49 @@ export function resolveSession({ session = 'latest', cwd = null, root = sessions
 }
 
 /**
+ * 明显不是「仓库里的改动」的路径：临时目录与日志。
+ *
+ * 为什么必须排除：bash 里 `npm test > /tmp/out.log`、`cmd 2>&1 | tee /tmp/x.log` 是**读**操作
+ * 的常见写法。把它们算成「改了 2 个文件」，默认判据（files >= 2 && subagents === 0）立刻误报。
+ * 排除项不静默丢：计入 `bashEdits.scratchExcluded` 并在报告里说明。
+ */
+const SCRATCH_PREFIXES = [os.tmpdir()]
+
+/** 这个 bash 写目标算不算「仓库里的改动」（临时目录/日志不算）。 */
+export function isScratchTarget(target) {
+  if (typeof target !== 'string' || target === '') return true
+  const resolved = target.startsWith('~') ? path.join(os.homedir(), target.slice(1).replace(/^[/\\]/, '')) : target
+  const normalized = path.isAbsolute(resolved) ? resolved : path.resolve(resolved)
+  for (const prefix of SCRATCH_PREFIXES) {
+    if (prefix && normalized.startsWith(prefix)) return true
+  }
+  return normalized.startsWith('/tmp/') || normalized.startsWith('/var/folders/') || normalized.startsWith('/dev/')
+}
+
+/**
  * 核心分析：父会话 + 所有子会话 → 统计与结论。
  *
  * 子会话关联靠父日志里的 `subagent/catalog`（`childId`），目录是同 workspace 下的
  * `session-<childId>`。同一 childId 可能被登记多次（持久子 agent 反复出现），读取时按 id 去重，
  * 但 `subagents` 计数仍按事件数（契约如此）。
+ *
+ * @param {string} sessionDir
+ * @param {{cwd?: string|null, personas?: {name: string, bodyLines?: string[]}[], personaUnavailableReason?: string|null, personaVerdict?: boolean, strictAttribution?: boolean, judgeOptions?: object}} [options]
+ *   `personas` 不传时人格检查**不执行**（记 warning，不计 checked）—— 调用方（`inspect`）
+ *   负责先用 `loadPersonaCorpus` 扫清单。这样纯函数层不碰磁盘，测试可以直接喂清单。
  */
-export function analyzeSession(sessionDir, { cwd } = {}) {
+export function analyzeSession(
+  sessionDir,
+  {
+    cwd = null,
+    personas = undefined,
+    personaRoot = null,
+    personaUnavailableReason = null,
+    personaVerdict = false,
+    strictAttribution = false,
+    env = process.env,
+  } = {},
+) {
   const parentRead = readSessionEvents(sessionDir)
   const meta = readSessionMeta(parentRead.events)
   const warnings = []
@@ -789,10 +1283,40 @@ export function analyzeSession(sessionDir, { cwd } = {}) {
   const parentStats = countCalls(parentRead.events, '主会话')
   warnings.push(...parentStats.warnings)
 
+  // 人格清单**按需扫描**：本轮没有 subagent 调用就没有「队友 prompt」要判，扫 300+ 份 md
+  // 纯属浪费（本工具挂进 verify，每个会话跑一次）。有 subagent 才真的去扫。
+  let personaList = Array.isArray(personas) ? personas : null
+  let personaGap = personaUnavailableReason
+  if (personaList === null) {
+    const needsPersona = parentRead.events.some(
+      (event) =>
+        event && event.type === 'tool/call' && event.data && typeof event.data.name === 'string' && SUBAGENT_TOOLS.has(event.data.name),
+    )
+    if (needsPersona) {
+      const corpus = loadPersonaCorpus({ root: personaRoot === null ? null : personaRoot, env })
+      if (corpus.ok) {
+        personaList = corpus.personas
+        warnings.push(...corpus.warnings)
+        warnings.push(`人格清单：${corpus.personas.length} 位（扫描 ${corpus.root}）`)
+      } else {
+        personaList = []
+        personaGap = corpus.reason
+        warnings.push(...corpus.warnings)
+      }
+    } else {
+      personaList = []
+    }
+  }
+
   // 派活计数：全部来自父日志，**不依赖子会话日志是否落盘**（后者实测大多缺失）。
   // 四项里只有 subagents 能当「派过实现」的证据，其余三项只作咨询证据（见 countDispatch 注释）。
   // 传 warnings 进去：人格检查要读 `arguments.prompt`，解析失败要留痕（但不计入 checked）。
-  const dispatch = countDispatch(parentRead.events, warnings)
+  const diagnostics = { personaUnavailable: null }
+  const dispatch = countDispatch(parentRead.events, warnings, {
+    personas: personaList || [],
+    personaUnavailableReason: personaGap,
+    diagnostics,
+  })
   if (dispatch.subagents > 0 && dispatch.catalog === 0) {
     warnings.push(
       `父日志里有 ${dispatch.subagents} 次 subagent 调用但没有任何 subagent/catalog 登记，无法定位子会话日志（归因精度降级）`,
@@ -810,7 +1334,9 @@ export function analyzeSession(sessionDir, { cwd } = {}) {
 
   const children = []
   let childEdits = 0
+  let childBashEdits = 0
   const allFiles = [...parentStats.files]
+  const allBashWrites = parentStats.bashWrites.map((write) => ({ ...write, scope: '主会话' }))
 
   for (const catalog of catalogs) {
     const childId = catalog.childId
@@ -834,7 +1360,9 @@ export function analyzeSession(sessionDir, { cwd } = {}) {
         const childStats = countCalls(childRead.events, `子会话 ${label} `)
         warnings.push(...childStats.warnings)
         edits = childStats.edits
+        childBashEdits += childStats.bashEdits
         allFiles.push(...childStats.files)
+        allBashWrites.push(...childStats.bashWrites.map((write) => ({ ...write, scope: `子会话 ${label}`.trim() })))
         found = true
       } catch (error) {
         // 子会话日志读不出来不影响主结论：如实记 warning，childEdits 保持已统计到的值。
@@ -846,15 +1374,42 @@ export function analyzeSession(sessionDir, { cwd } = {}) {
     children.push({ id: childId, name: catalog.name || null, label: catalog.label || null, dir: childDir, found, edits })
   }
 
-  const files = [...new Set(allFiles)]
+  // bash 写文件：单列、标 confidence low；只有「看起来在仓库里」的目标才并入 files
+  // （临时目录/日志是读操作的常见写法，并进去会让默认判据误报 —— 见 isScratchTarget）。
+  const bashWrites = allBashWrites.map((write) => ({ ...write, counted: !isScratchTarget(write.path) }))
+  const bashFiles = [...new Set(bashWrites.filter((write) => write.counted).map((write) => write.path))]
+  const scratchExcluded = bashWrites.filter((write) => !write.counted).length
+  if (scratchExcluded > 0) {
+    warnings.push(
+      `有 ${scratchExcluded} 处 bash 写操作落在临时目录/日志上（如 > /tmp/x.log），未计入改动文件：` +
+        `${bashWrites
+          .filter((write) => !write.counted)
+          .map((write) => write.path)
+          .join('、')}`,
+    )
+  }
+  const bashEdits = {
+    count: parentStats.bashEdits + childBashEdits,
+    parent: parentStats.bashEdits,
+    child: childBashEdits,
+    confidence: 'low',
+    scratchExcluded,
+    writes: bashWrites,
+  }
+
+  const files = [...new Set([...allFiles, ...bashFiles])]
 
   const attribution = summarizeAttribution({ children, dispatch })
   const judgment = judge({
     files,
     parentEdits: parentStats.edits,
+    parentBashEdits: parentStats.bashEdits,
     childEdits,
     dispatch,
     attribution,
+    personaUnavailable: diagnostics.personaUnavailable,
+    personaVerdict,
+    strictAttribution,
   })
 
   const report = {
@@ -870,6 +1425,8 @@ export function analyzeSession(sessionDir, { cwd } = {}) {
     fileCount: files.length,
     parentEdits: parentStats.edits,
     childEdits,
+    bashEdits,
+    bashFiles,
     experts: parentStats.experts,
     // 兼容旧字段：历史语义是「subagent/catalog 事件数」，新代码请读 dispatch.subagents。
     subagents: catalogs.length,
@@ -963,15 +1520,21 @@ function violationDetail({ fileCount, parentEdits, dispatch = {} }) {
 }
 
 /**
- * 判定规则（严格按契约实现，从上到下命中即停）：
+ * 判定规则（**从上到下命中即停**，顺序就是代码顺序，改顺序 = 改判据）：
  *
- *   ① `parentEdits === 0` → PASS（主会话没改）
+ *   ⓪ `personaVerdict && dispatch.persona.missing > 0` → VIOLATION
+ *      （仅 `--persona-verdict` 时存在；它先于文件数判定：没改几个文件不能豁免「队友没带人格」）
+ *   ① `parentEdits === 0` → PASS（主会话没 edit/write）
  *   ② `files.length <= 1` → PASS（单文件豁免）
- *   ③ `files.length >= 2 && parentEdits > 0`：
- *      - `dispatch.subagents > 0` → PASS（真派了实现队友 subagent / subagent_fork）
- *      - 否则 → VIOLATION（文案按「只叫了咨询」/「什么都没叫」分两种，见 violationDetail）
+ *   ③ `files.length >= 2 && parentEdits > 0 && subagents === 0` → VIOLATION
+ *      （文案按「只叫了咨询」/「什么都没叫」/「只有子会话登记」分开写，见 violationDetail）
+ *   ④ `strictAttribution && parentEdits >= 2 && files.length >= 2 && childEdits === 0` → VIOLATION
+ *      （放在 ③ 之后：③ 是更具体的诊断，先判它，违规文案才不会丢掉「只叫了专家」那句原因）
+ *   ⑤ 其余（真派了实现队友）→ PASS
  *
- * **两条硬约束：**
+ * ④ 未开启时，同一条件会被写成一条 warning（可见但不拦）—— 否则开关等于没人知道。
+ *
+ * **四条硬约束（前两条是核心，后两条是本次新增判据的边界）：**
  * ① **VIOLATION 条件里不得出现 `childEdits`。** 实测子会话日志大多不落盘，拿它当否决判据会把
  *    「723 行代码确实由子 agent 写」误判成「子 agent 改 0 次」。`childEdits` 仍然收、仍然输出，
  *    但只用于归因说明（配合 `attribution.confidence`）。
@@ -979,25 +1542,62 @@ function violationDetail({ fileCount, parentEdits, dispatch = {} }) {
  *    `summon_expert` 一次性咨询不写代码、`expert_brief` 是纯函数不写盘、`subagent/catalog` 连
  *    咨询专家也会登记（`mode` 全为 `continuable`，区分不了咨询与实现）。把它们算进放行条件，
  *    「叫了专家评审、实现自己全干完」就会判 PASS —— 而那正是本工具要抓的形态。
- * ③ **人格检查（`dispatch.persona`）只进 `warnings`，不进 `verdict`。** 它回答的是「队友 prompt
- *    里有没有专家人格」，与「实现交给谁」正交：真实事故里三个队友命名全对、prompt 零 persona，
- *    判定本身没有问题（确实派了人），问题在「派的质量」。把它算进放行条件会让大批历史会话判违规
- *    （起名字容易、贴 persona 需要人主动做），闸门一上线就满地红灯、结论没人看。先让它可见。
+ * ③ **人格检查（`dispatch.persona`）默认只进 `warnings`，不进 `verdict`。** 它回答的是「队友
+ *    prompt 里有没有专家人格」，与「实现交给谁」正交：真实事故里三个队友命名全对、prompt 零
+ *    persona，判定本身没有问题（确实派了人），问题在「派的质量」。默认不判，是因为算进去会让
+ *    大批历史会话判违规（起名字容易、贴 persona 需要人主动做），闸门一上线就满地红灯。
+ *    显式加 `--persona-verdict`（`personaVerdict: true`）才让它进 verdict。
+ * ④ **严格归因（`strictAttribution`）默认关。** 开了之后 `parentEdits >= 2 && fileCount >= 2
+ *    && childEdits === 0` 直接判 VIOLATION。默认关是因为 `childEdits === 0` 最常见的成因是
+ *    **子会话日志没落盘**（实测大多数不落盘），而不是队友真的没干活 —— 默认开会把
+ *    「代码确实是子 agent 写的」判成违规。开了就按字面判，并在文案里写明日志是否可读。
  */
-export function judge({ files = [], parentEdits = 0, childEdits = 0, dispatch = {}, attribution = null } = {}) {
+export function judge({
+  files = [],
+  parentEdits = 0,
+  parentBashEdits = 0,
+  childEdits = 0,
+  dispatch = {},
+  attribution = null,
+  personaUnavailable = null,
+  personaVerdict = false,
+  strictAttribution = false,
+} = {}) {
   const fileCount = Array.isArray(files) ? files.length : 0
   const subagents = Number(dispatch.subagents) || 0
+  const personaLacking = Number(dispatch && dispatch.persona ? dispatch.persona.missing : 0) || 0
+  const bashCount = Number(parentBashEdits) || 0
 
-  // 人格检查只**追加 warning**，绝不进 verdict：判定只看 `dispatch.subagents`（见下方 ③）。
+  // 人格检查默认只**追加 warning**：判定只看 `dispatch.subagents`（见下方 ③）。
   // 三条短路（① ② ③ 与末尾 PASS）都要带上它 —— 「队友 prompt 里没人格」与「主会话改了几个
   // 文件」是两件正交的事，只在某一条分支里提示，换个场景就静默了（这正是这次事故的形态：
   // 命名全对、判定也 PASS，于是没人发现人格根本没进 prompt）。
   const personaWarning = buildPersonaWarning(dispatch)
   const withPersona = (warnings) => (personaWarning ? [...warnings, personaWarning] : warnings)
 
+  // `--persona-verdict` 打开后才把「队友缺人格」当违规。它**先于**文件数判定：
+  // 「没改几个文件」不能豁免「派出去的队友没带人格」—— 那是两个维度，混在一起会互相掩盖。
+  if (personaVerdict && personaLacking > 0) {
+    const detail = `本轮 ${personaLacking} 个队友的 prompt 里没有专家人格（--persona-verdict 生效）`
+    return {
+      verdict: 'VIOLATION',
+      warnings: withPersona([
+        `${detail} —— 用 expert_brief 生成任务书，或把人格 md 正文整段贴进 prompt`,
+        ...(personaUnavailable ? [`注意：${personaUnavailable}`] : []),
+      ]),
+      summary: `VIOLATION：${detail}`,
+    }
+  }
+
   // ① ② 先短路：主会话没改 / 只改一个文件，不涉及「有没有把实现交出去」。
+  //    注意 `parentEdits === 0` 只看 edit/write：bash 写的文件会进 fileCount（见下），
+  //    但**不解除**这条短路 —— 「主会话一次 edit 都没做」确实无从谈「实现没交出去」。
   if (parentEdits === 0) {
-    return { verdict: 'PASS', warnings: withPersona([]), summary: 'PASS：主会话没有 edit/write' }
+    const extra =
+      bashCount > 0
+        ? [`主会话没有 edit/write，但有 ${bashCount} 次 bash 写操作（confidence: low，只计入文件数、不参与判定）`]
+        : []
+    return { verdict: 'PASS', warnings: withPersona(extra), summary: 'PASS：主会话没有 edit/write' }
   }
   if (fileCount <= 1) {
     return {
@@ -1006,6 +1606,7 @@ export function judge({ files = [], parentEdits = 0, childEdits = 0, dispatch = 
       summary: `PASS：只改了 ${fileCount} 个文件，命中单文件豁免`,
     }
   }
+
 
   // ③ 多文件 + 主会话自己改：**唯一**的放行条件是「派过实现队友」。
   //    这条 if 里只允许出现 subagents。把 expertCalls / briefs / catalog 加进来，就等于
@@ -1019,12 +1620,38 @@ export function judge({ files = [], parentEdits = 0, childEdits = 0, dispatch = 
     }
   }
 
+  // ④ 严格归因（默认关）：主会话自己跨多文件改 >=2 次，而可读到的子会话改动是 0。
+  //    放在 `subagents === 0` 之后：那条是更具体的诊断（「只叫了专家」/「什么都没叫」），
+  //    先判它，违规文案才不会丢掉读者最需要的那句原因。
+  if (strictAttribution && parentEdits >= 2 && fileCount >= 2 && childEdits === 0) {
+    const confidence = attribution ? attribution.confidence : 'high'
+    const caveat =
+      confidence === 'low'
+        ? '（注意：本轮子会话日志不可读，childEdits=0 也可能只是日志没落盘 —— 需要更准的归因请补齐子会话日志）'
+        : ''
+    const detail = `主会话跨 ${fileCount} 个文件改了 ${parentEdits} 次，而子会话可读到的改动是 0 次（--strict-attribution 生效）`
+    return {
+      verdict: 'VIOLATION',
+      warnings: withPersona([`${detail}${caveat}`]),
+      summary: `VIOLATION：${detail}`,
+    }
+  }
+
+  // 严格归因关着时，把「本该判违规」的情形显式提示出来（可见但不拦），否则开关等于没人知道。
+  const strictHint =
+    !strictAttribution && parentEdits >= 2 && fileCount >= 2 && childEdits === 0
+      ? [
+          `严格归因未开启（--strict-attribution）：主会话跨 ${fileCount} 个文件改了 ${parentEdits} 次且子会话改动为 0，` +
+            '当前只提示、不判违规',
+        ]
+      : []
+
   // 派过实现队友：子会话日志缺失只影响归因精度，不代表没派人。
   const missing = attribution && Number(attribution.childLogsMissing) > 0
   const confidence = attribution ? attribution.confidence : 'high'
   const found = Number(attribution ? attribution.childLogsFound : 0) || 0
   const reason = `本轮派了 ${subagents} 次实现队友（${describeDispatch(dispatch)}）`
-  const warnings = []
+  const warnings = [...strictHint]
 
   if (confidence === 'low') {
     warnings.push(
@@ -1072,6 +1699,10 @@ export function renderHuman(report) {
   lines.push(`  files（去重文件数）  ${report.fileCount}`)
   lines.push(`  parentEdits          ${report.parentEdits}`)
   lines.push(`  childEdits           ${report.childEdits}`)
+  // bash 写文件单独一行、显式标 confidence low：它和 edit/write 不是同一个证据等级，
+  // 混进 parentEdits 会让读者以为自己看见的是结构化事实。
+  const bash = report.bashEdits || { count: 0, parent: 0, child: 0, confidence: 'low', scratchExcluded: 0, writes: [] }
+  lines.push(`  bashEdits            ${bash.count}（confidence: ${bash.confidence}；主 ${bash.parent} / 子 ${bash.child}${bash.scratchExcluded > 0 ? `；临时目录已排除 ${bash.scratchExcluded}` : ''}）`)
 
   // 旧字段 experts / subagents 只留在 JSON 里（experts 与 expertCalls 同值、subagents 是
   // 子会话登记数）；人类输出统一用下面两行，避免同一份报告出现两个互相矛盾的数字。
@@ -1113,6 +1744,14 @@ export function renderHuman(report) {
     for (const file of report.files) lines.push(`  - ${file}`)
   }
 
+  // bash 写操作明细：只列被计入改动文件集合的（其余在 warnings 里说明为什么没计入）。
+  const bashWrites = Array.isArray(bash.writes) ? bash.writes.filter((write) => write.counted) : []
+  if (bashWrites.length > 0) {
+    lines.push('')
+    lines.push('bash 写文件（confidence: low，从命令串解析）')
+    for (const write of bashWrites) lines.push(`  - [${write.kind}] ${write.path}（${write.scope}）`)
+  }
+
   if (report.warnings.length > 0) {
     lines.push('')
     lines.push('warnings')
@@ -1146,14 +1785,46 @@ export function describeSelection(session = {}) {
       return '按 --session 提供的目录（不看当前目录）'
     case 'selector':
       return '按 --session 提供的 uuid（不看当前目录）'
+    case 'env':
+      return '按环境变量里的会话 id（--session current / 缺省行为）'
     default:
       return null
   }
 }
 
-/** 供测试/库调用：跑一次分析并返回报告（不打印、不退出）。 */
-export function inspect({ session = 'latest', cwd = null, anyCwd = false, root = sessionsRoot() } = {}) {
-  const selector = session === undefined || session === null || session === '' ? 'latest' : String(session)
+/**
+ * 供测试/库调用：跑一次分析并返回报告（不打印、不退出）。
+ *
+ * `session` 缺省是 **null**（读环境变量），与 CLI 一致 —— 库调用同样不该「猜会话」。
+ * 取不到会话 id 时抛 `CliError`（exit 1），调用方按错误处理。
+ *
+ * @param {{session?: string|null, cwd?: string|null, anyCwd?: boolean, root?: string, sessionEnv?: string|null, allowLatest?: boolean, personaRoot?: string|null, personaVerdict?: boolean, strictAttribution?: boolean, diagnose?: {warnings: string[]}, env?: Record<string,string|undefined>}} [options]
+ */
+export function inspect({
+  session = null,
+  cwd = null,
+  anyCwd = false,
+  root = sessionsRoot(),
+  sessionEnv = null,
+  allowLatest = false,
+  personaRoot = null,
+  personaVerdict = false,
+  strictAttribution = false,
+  diagnose = null,
+  env = process.env,
+} = {}) {
+  let resolvedSelector
+  try {
+    resolvedSelector = resolveSelector({ session, sessionEnv, allowLatest, env })
+  } catch (error) {
+    // 只给了 --cwd 却取不到会话 id 的人，心里想的其实是「查这个目录下的会话」。
+    // 把这条具体出路补进 hint，否则他只能自己去猜参数组合。
+    if (cwd && error && typeof error === 'object' && typeof error.hint === 'string') {
+      error.hint = `${error.hint}\n只给 --cwd 时请再指定会话来源：--session latest --allow-latest --cwd ${cwd}（或 --session <uuid> --cwd ${cwd}）`
+    }
+    throw error
+  }
+  const selector = resolvedSelector.session
   const effective = effectiveCwd({ session: selector, cwd, anyCwd })
   const { dir, resolvedBy, cwdFallback } = resolveSession({
     session: selector,
@@ -1164,11 +1835,32 @@ export function inspect({ session = 'latest', cwd = null, anyCwd = false, root =
   })
 
   // 退回全盘时不要写 cwdFilter：那一刻并没有按 cwd 筛过，写了就是假证据。
-  const report = analyzeSession(dir, { cwd: cwdFallback ? null : effective.cwd })
+  const report = analyzeSession(dir, {
+    cwd: cwdFallback ? null : effective.cwd,
+    personaRoot,
+    personaVerdict,
+    strictAttribution,
+    env,
+  })
+  report.session.selectorSource = resolvedSelector.source
+  report.session.selectorEnv = resolvedSelector.envName
+  if (resolvedSelector.source === 'latest-allowed') {
+    const note = `--session latest 已按 --allow-latest 放行：它会按 cwd+mtime 猜会话，可能检查的不是当前会话`
+    report.warnings.push(note)
+    if (diagnose && Array.isArray(diagnose.warnings)) diagnose.warnings.push(note)
+  }
   report.session.resolvedBy = resolvedBy
   report.session.cwdSource = effective.source
   report.session.selectedBy =
-    resolvedBy === 'dir'
+    resolvedSelector.source === 'latest-allowed'
+      ? cwdFallback
+        ? 'implicit-fallback'
+        : effective.source === 'any-cwd'
+          ? 'any-cwd'
+          : effective.source === 'explicit'
+            ? 'explicit'
+            : 'implicit'
+      : resolvedBy === 'dir'
       ? 'dir'
       : cwdFallback
         ? 'implicit-fallback'
@@ -1180,7 +1872,9 @@ export function inspect({ session = 'latest', cwd = null, anyCwd = false, root =
               : 'implicit'
           : effective.source === 'explicit'
             ? 'explicit'
-            : 'selector'
+            : resolvedSelector.source === 'env'
+              ? 'env'
+              : 'selector'
   if (resolvedBy === 'prefix-ambiguous') {
     report.warnings.push('--session 的前缀匹配到多个会话，已取最新那个；给完整 uuid 可消除歧义')
   }
@@ -1210,14 +1904,29 @@ function main(argv) {
   }
 
   let report
+  const diagnose = { warnings: [] }
   try {
-    report = inspect({ session: opts.session, cwd: opts.cwd, anyCwd: opts.anyCwd })
+    report = inspect({
+      session: opts.session,
+      cwd: opts.cwd,
+      anyCwd: opts.anyCwd,
+      sessionEnv: opts.sessionEnv,
+      allowLatest: opts.allowLatest,
+      personaRoot: opts.personaRoot,
+      personaVerdict: opts.personaVerdict,
+      strictAttribution: opts.strictAttribution,
+      diagnose,
+    })
   } catch (error) {
     process.stderr.write(`dispatch-check: ${error.message}\n`)
     if (error.hint) process.stderr.write(`${error.hint}\n`)
     process.exitCode = error.exitCode || EXIT.ERROR
     return
   }
+
+  // 逃生口的警告走 stderr：报告本身也留了同一条 warning，但 stderr 是「终端里直接看得见」的
+  // 那一份，不能只写在 --json 才读到的字段里。
+  for (const warning of diagnose.warnings) process.stderr.write(`dispatch-check: 警告：${warning}\n`)
 
   if (opts.json) {
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)

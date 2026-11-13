@@ -6,12 +6,18 @@
   "main": "./lib/index.js",
   "bin": {
     "expert-brief": "./bin/expert-brief.mjs",
-    "dispatch-check": "./bin/dispatch-check.mjs"
+    "dispatch-check": "./bin/dispatch-check.mjs",
+    "handoff": "./bin/handoff.mjs",
+    "tier": "./bin/tier.mjs",
+    "phase": "./bin/phase.mjs"
   },
   "exports": {
     ".": "./lib/index.js",
     "./persona": "./lib/persona.mjs",
     "./brief": "./lib/brief.mjs",
+    "./handoff": "./lib/handoff.mjs",
+    "./tier": "./lib/tier.mjs",
+    "./phase": "./lib/phase.mjs",
     "./lib/*": "./lib/*",
     "./package.json": "./package.json"
   },
